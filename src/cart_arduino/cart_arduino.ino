@@ -29,8 +29,10 @@
  *   - First keypress in S_IDLE is now captured after enterState() to avoid
  *     being wiped by the inputBuffer reset inside enterState().
  *   - checkoutRecords[] changed from int to long, and student number parsing
- *     changed to strtol() since Arduino's String class has no .toLong() method.
- *   - Fingerprint confidence threshold lowered to 30 for improved reliability.
+ *     changed to strtol() since Arduino's int is 16-bit and overflows on
+ *     9-digit student numbers.
+ *   - Fingerprint confidence threshold lowered to 30 for improved reliability
+ *     with consumer-grade sensors.
  *   - S_BULK_COMPLETE LCD message corrected to reflect that only free slots
  *     are assigned, not all slots, and shortened to fit 16-char display.
  *   - checkoutRecords[] now persisted to EEPROM so data survives power cycles.
@@ -47,10 +49,16 @@
  *     fragmentation and reduce RAM usage.
  *   - All string literals wrapped in F() macro to store them in flash instead
  *     of RAM.
- *   - Input timeout added: S_ENTERING_STUDENT_NUMBER, S_ENTERING_CN_OUT, and
- *     S_ENTERING_CN_IN auto-reset to S_IDLE after INPUT_TIMEOUT_MS of inactivity.
+ *   - Input timeout added: S_ENTERING_STUDENT_NUMBER, S_ENTERING_CN_OUT,
+ *     S_ENTERING_CN_IN, and S_ENTERING_ADMIN_NUMBER auto-reset to S_IDLE
+ *     after INPUT_TIMEOUT_MS of inactivity.
  *   - Bulk op count now displayed on LCD line 2 of S_BULK_COMPLETE and
  *     S_BULK_IN_COMPLETE so the admin can confirm how many CBs were processed.
+ *   - Dead itoa() pre-fill of currentCN removed from checkOpenRecord().
+ *     handleCNInput() always overwrites currentCN from inputBuffer before
+ *     calling confirmSignIn(), so the pre-fill had no effect.
+ *   - handleCNInput() now shows an "Enter CB #" error if # is pressed while
+ *     the input buffer is empty, instead of silently ignoring the keypress.
  *
  * Team: Julian D., Ethan A., Lennon F. - TEJ4M
  */
@@ -62,7 +70,12 @@
 #include <Adafruit_Fingerprint.h>
 #include <EEPROM.h>
 
-// --- Keypad Setup ---
+// =============================================================================
+// Hardware Setup
+// =============================================================================
+
+// --- Keypad ---
+// 4x3 matrix keypad. Rows on pins 2-5, columns on pins 6-8.
 const byte ROWS = 4;
 const byte COLS = 3;
 char keys[ROWS][COLS] = {
@@ -75,83 +88,102 @@ byte rowPins[ROWS] = {2, 3, 4, 5};
 byte colPins[COLS] = {6, 7, 8};
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 
-// --- LCD Setup ---
-// Grove LCD RGB Backlight - no I2C address needed, handled by library
+// --- LCD ---
+// Grove LCD RGB Backlight on I2C (A4/A5). No address needed; handled by library.
 rgb_lcd lcd;
 
-// --- Fingerprint Sensor Setup ---
-// RX = pin 9, TX = pin 10
+// --- Fingerprint Sensor ---
+// Adafruit fingerprint sensor on SoftwareSerial: RX = pin 9, TX = pin 10.
+// Templates are stored on the sensor's onboard flash, not in Arduino RAM.
 SoftwareSerial fingerprintSerial(9, 10);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerprintSerial);
 
-// --- State Machine ---
-// Prefixed with S_ to avoid collision with Keypad library's KeyState enum,
-// which defines its own IDLE value.
+// =============================================================================
+// State Machine
+// =============================================================================
+
+// Prefixed with S_ to avoid collision with the Keypad library's KeyState enum,
+// which defines its own IDLE constant.
 enum State {
-  S_IDLE,
-  S_ENTERING_STUDENT_NUMBER,
-  S_ENTERING_CN_OUT,
-  S_ENTERING_CN_IN,
-  S_SIGN_OUT_SUCCESS,
-  S_SIGN_IN_SUCCESS,
-  S_ERROR_DISPLAY,
-  S_WAITING_FOR_FINGERPRINT,
-  S_ENTERING_ADMIN_NUMBER,
-  S_ADMIN_MENU,
-  S_BULK_CONFIRM,
-  S_BULK_COMPLETE,
-  S_BULK_IN_CONFIRM,
-  S_BULK_IN_COMPLETE
+  S_IDLE,                    // waiting for first keypress or * for admin
+  S_ENTERING_STUDENT_NUMBER, // student typing their 9-digit number
+  S_ENTERING_CN_OUT,         // student typing Chromebook number to sign out
+  S_ENTERING_CN_IN,          // student typing Chromebook number to sign in
+  S_SIGN_OUT_SUCCESS,        // confirmation message shown for 3s then -> IDLE
+  S_SIGN_IN_SUCCESS,         // confirmation message shown for 3s then -> IDLE
+  S_ERROR_DISPLAY,           // error message shown for 3s then -> IDLE
+  S_WAITING_FOR_FINGERPRINT, // admin flow: waiting for finger on sensor
+  S_ENTERING_ADMIN_NUMBER,   // admin flow: typing 9-digit staff number
+  S_ADMIN_MENU,              // admin flow: choose bulk-out (3), bulk-in (2), or back (*)
+  S_BULK_CONFIRM,            // admin flow: confirm sign-out of entire cart
+  S_BULK_COMPLETE,           // admin flow: bulk sign-out done, shown for 3s
+  S_BULK_IN_CONFIRM,         // admin flow: confirm sign-in of entire cart
+  S_BULK_IN_COMPLETE         // admin flow: bulk sign-in done, shown for 3s
 };
 
 State currentState = S_IDLE;
 
-// --- Data ---
-// Records persisted to EEPROM: index = Chromebook number - 1, value = student number (0 = available)
+// =============================================================================
+// Data
+// =============================================================================
+
+// Checkout records: index = Chromebook number - 1, value = student number.
+// 0 means the Chromebook is available. Persisted to EEPROM.
+// long is required because 9-digit student numbers overflow Arduino's 16-bit int.
 const int MAX_CHROMEBOOKS = 30;
 long checkoutRecords[MAX_CHROMEBOOKS];
 
 // EEPROM layout:
-//   Bytes 0-119:  checkoutRecords (30 x 4 bytes each)
-//   Bytes 120-123: magic number (detects whether EEPROM has been initialized)
+//   Bytes   0-119: checkoutRecords (30 longs x 4 bytes each)
+//   Bytes 120-123: magic number (used to detect whether EEPROM has been
+//                  initialized; avoids treating garbage as valid records)
 const int EEPROM_BASE_ADDR  = 0;
-const int EEPROM_MAGIC_ADDR = MAX_CHROMEBOOKS * sizeof(long);  // 120
+const int EEPROM_MAGIC_ADDR = MAX_CHROMEBOOKS * sizeof(long);  // = 120
 const long EEPROM_MAGIC     = 12345678L;
 
-const int STUDENT_NUMBER_LENGTH = 9;
-const int ADMIN_NUMBER_LENGTH   = 9;
-const int CN_LENGTH = 2;
+// Input length constraints
+const int STUDENT_NUMBER_LENGTH = 9;  // exactly 9 digits
+const int ADMIN_NUMBER_LENGTH   = 9;  // same format as student number
+const int CN_LENGTH             = 2;  // Chromebook numbers 1-30 (1 or 2 digits)
 
-// Fingerprint scan will time out and return to idle after this duration
-const int FINGERPRINT_TIMEOUT_MS = 10000;
+// Timeout durations (milliseconds)
+const unsigned long FINGERPRINT_TIMEOUT_MS    = 10000;  // 10s to scan finger
+const unsigned long INPUT_TIMEOUT_MS          = 15000;  // 15s idle on any input state
+const unsigned long MESSAGE_DISPLAY_DURATION_MS = 3000; // 3s for success/error messages
 
-// Keypad input states will time out and return to idle after this duration
-const int INPUT_TIMEOUT_MS = 15000;
+// Fixed-size char arrays replace String objects to avoid heap fragmentation.
+// Sizes include the null terminator.
+char inputBuffer[10]          = "";  // active typing buffer (max 9 digits + \0)
+char currentStudentNumber[10] = "";  // student number confirmed this session
+char currentAdminNumber[10]   = "";  // admin number confirmed after fingerprint
+char currentCN[3]             = "";  // Chromebook number confirmed this session (max 2 digits + \0)
+char errorMessage[17]         = "";  // error text for LCD line 2 (max 16 chars + \0)
 
-// Fixed char arrays replace String objects to eliminate heap fragmentation
-char inputBuffer[10]          = "";  // max 9 digits + null
-char currentStudentNumber[10] = "";
-char currentAdminNumber[10]   = "";
-char currentCN[3]             = "";  // max 2 digits + null
-char errorMessage[17]         = "";  // max 16 chars + null
-
+// Timestamp of when the current state was entered, used for timeouts
 unsigned long stateEnteredAt = 0;
-const int MESSAGE_DISPLAY_DURATION_MS = 3000;
 
-// Stores the count from the last bulk operation for LCD display
+// Result count from the most recent bulk operation, shown on the completion screen
 int lastBulkCount = 0;
 
-// --- EEPROM Helpers ---
+// =============================================================================
+// EEPROM Helpers
+// =============================================================================
 
+// Write one checkout record to EEPROM at the correct byte offset.
+// Called immediately after any change to checkoutRecords[index].
 void saveRecord(int index) {
   EEPROM.put(EEPROM_BASE_ADDR + index * sizeof(long), checkoutRecords[index]);
 }
 
+// Load all checkout records from EEPROM on boot.
+// If the magic number is missing (first power-on or after a flash), all records
+// are initialized to 0 and the magic number is written so subsequent boots
+// load real data.
 void loadRecords() {
   long magic;
   EEPROM.get(EEPROM_MAGIC_ADDR, magic);
   if (magic != EEPROM_MAGIC) {
-    // First boot: initialize all records to 0 and write magic number
+    // First boot: EEPROM is uninitialized. Zero all records and mark as ready.
     for (int i = 0; i < MAX_CHROMEBOOKS; i++) {
       checkoutRecords[i] = 0;
       EEPROM.put(EEPROM_BASE_ADDR + i * sizeof(long), checkoutRecords[i]);
@@ -159,6 +191,7 @@ void loadRecords() {
     EEPROM.put(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
     Serial.println(F("EEPROM initialized."));
   } else {
+    // Normal boot: load previously saved records into RAM.
     for (int i = 0; i < MAX_CHROMEBOOKS; i++) {
       EEPROM.get(EEPROM_BASE_ADDR + i * sizeof(long), checkoutRecords[i]);
     }
@@ -166,19 +199,25 @@ void loadRecords() {
   }
 }
 
-// --- Setup ---
+// =============================================================================
+// Setup
+// =============================================================================
 
 void setup() {
   Serial.begin(9600);
+
+  // LCD: 16 columns, 2 rows. Default backlight is green (idle color).
   lcd.begin(16, 2);
-  lcd.setRGB(0, 255, 0);      // green backlight by default
+  lcd.setRGB(0, 255, 0);
 
   loadRecords();
 
+  // Fingerprint sensor communicates at 57600 baud over SoftwareSerial.
   finger.begin(57600);
   if (finger.verifyPassword()) {
     Serial.println(F("Fingerprint sensor found."));
   } else {
+    // System still works for student flow; admin mode will be unavailable.
     Serial.println(F("Fingerprint sensor not found - admin mode unavailable."));
   }
 
@@ -186,24 +225,33 @@ void setup() {
   Serial.println(F("Cart system ready."));
 }
 
-// --- Main Loop ---
+// =============================================================================
+// Main Loop
+// =============================================================================
 
 void loop() {
+  // Poll the keypad once per loop iteration. Returns '\0' if no key is pressed.
   char key = keypad.getKey();
 
   switch (currentState) {
+
     case S_IDLE:
+      // Any digit starts student number entry. * triggers admin fingerprint flow.
+      // # is ignored in idle (no context to submit).
       if (key && key != '*' && key != '#') {
         enterState(S_ENTERING_STUDENT_NUMBER);
-        inputBuffer[0] = key;   // set AFTER enterState clears it
+        // Capture the first digit AFTER enterState() clears inputBuffer,
+        // otherwise enterState() would wipe it immediately.
+        inputBuffer[0] = key;
         inputBuffer[1] = '\0';
-        updateLCDInput();       // show first digit on screen
+        updateLCDInput();
       } else if (key == '*') {
         enterState(S_WAITING_FOR_FINGERPRINT);
       }
       break;
 
     case S_ENTERING_STUDENT_NUMBER:
+      // Auto-cancel if no input received within the timeout window.
       if (millis() - stateEnteredAt >= INPUT_TIMEOUT_MS) {
         enterState(S_IDLE);
         break;
@@ -213,6 +261,7 @@ void loop() {
 
     case S_ENTERING_CN_OUT:
     case S_ENTERING_CN_IN:
+      // Auto-cancel if no input received within the timeout window.
       if (millis() - stateEnteredAt >= INPUT_TIMEOUT_MS) {
         enterState(S_IDLE);
         break;
@@ -220,6 +269,7 @@ void loop() {
       handleCNInput(key);
       break;
 
+    // These states just display a message and auto-return to idle after a delay.
     case S_ERROR_DISPLAY:
     case S_SIGN_OUT_SUCCESS:
     case S_SIGN_IN_SUCCESS:
@@ -229,6 +279,7 @@ void loop() {
       break;
 
     case S_WAITING_FOR_FINGERPRINT:
+      // * cancels and returns to idle; otherwise poll the sensor each loop tick.
       if (key == '*') {
         enterState(S_IDLE);
         break;
@@ -237,10 +288,16 @@ void loop() {
       break;
 
     case S_ENTERING_ADMIN_NUMBER:
+      // Auto-cancel if admin walks away mid-entry without finishing.
+      if (millis() - stateEnteredAt >= INPUT_TIMEOUT_MS) {
+        enterState(S_IDLE);
+        break;
+      }
       handleAdminNumberInput(key);
       break;
 
     case S_ADMIN_MENU:
+      // 2 = bulk sign-in, 3 = bulk sign-out, * = back to idle
       if (key == '2') {
         enterState(S_BULK_IN_CONFIRM);
       } else if (key == '3') {
@@ -251,6 +308,7 @@ void loop() {
       break;
 
     case S_BULK_CONFIRM:
+      // # confirms the bulk sign-out; * cancels and returns to admin menu.
       if (key == '#') {
         processBulkSignOut();
       } else if (key == '*') {
@@ -265,6 +323,7 @@ void loop() {
       break;
 
     case S_BULK_IN_CONFIRM:
+      // # confirms the bulk sign-in; * cancels and returns to admin menu.
       if (key == '#') {
         processBulkSignIn();
       } else if (key == '*') {
@@ -283,8 +342,13 @@ void loop() {
   }
 }
 
-// --- Input Handlers ---
+// =============================================================================
+// Input Handlers
+// =============================================================================
 
+// Accumulates keypad digits into inputBuffer until STUDENT_NUMBER_LENGTH is
+// reached, then calls checkOpenRecord() to determine sign-out vs sign-in.
+// * cancels at any point and returns to idle.
 void handleStudentNumberInput(char key) {
   if (!key) return;
 
@@ -293,6 +357,7 @@ void handleStudentNumberInput(char key) {
     return;
   }
 
+  // Accumulate digits (ignore # mid-entry; submission is automatic at 9 digits)
   if (key != '#') {
     int len = strlen(inputBuffer);
     if (len < STUDENT_NUMBER_LENGTH) {
@@ -302,6 +367,7 @@ void handleStudentNumberInput(char key) {
     }
   }
 
+  // Auto-submit once 9 digits have been entered
   if (strlen(inputBuffer) == STUDENT_NUMBER_LENGTH) {
     strncpy(currentStudentNumber, inputBuffer, 10);
     inputBuffer[0] = '\0';
@@ -309,6 +375,10 @@ void handleStudentNumberInput(char key) {
   }
 }
 
+// Accumulates keypad digits into inputBuffer for the admin staff number.
+// Behaves identically to handleStudentNumberInput() but targets currentAdminNumber
+// and transitions to S_ADMIN_MENU on completion.
+// * cancels and returns to idle.
 void handleAdminNumberInput(char key) {
   if (!key) return;
 
@@ -326,6 +396,7 @@ void handleAdminNumberInput(char key) {
     }
   }
 
+  // Auto-submit once 9 digits have been entered
   if (strlen(inputBuffer) == ADMIN_NUMBER_LENGTH) {
     strncpy(currentAdminNumber, inputBuffer, 10);
     inputBuffer[0] = '\0';
@@ -335,6 +406,9 @@ void handleAdminNumberInput(char key) {
   }
 }
 
+// Handles Chromebook number entry for both sign-out and sign-in.
+// # submits the entered digits. * cancels and returns to idle.
+// Pressing # with an empty buffer shows an error instead of silently ignoring it.
 void handleCNInput(char key) {
   if (!key) return;
 
@@ -345,6 +419,7 @@ void handleCNInput(char key) {
 
   if (key == '#') {
     if (strlen(inputBuffer) > 0) {
+      // Copy the typed number and proceed to confirmation logic
       strncpy(currentCN, inputBuffer, 3);
       inputBuffer[0] = '\0';
       if (currentState == S_ENTERING_CN_OUT) {
@@ -352,10 +427,14 @@ void handleCNInput(char key) {
       } else {
         confirmSignIn();
       }
+    } else {
+      // # pressed with nothing typed; prompt the user to enter a number first
+      showError("Enter CB #");
     }
     return;
   }
 
+  // Accumulate up to CN_LENGTH digits (max 2 for CBs 1-30)
   int len = strlen(inputBuffer);
   if (len < CN_LENGTH) {
     inputBuffer[len]     = key;
@@ -364,6 +443,9 @@ void handleCNInput(char key) {
   }
 }
 
+// Polls the fingerprint sensor once per loop tick while in S_WAITING_FOR_FINGERPRINT.
+// On a confident match (confidence >= 30), transitions to S_ENTERING_ADMIN_NUMBER.
+// Times out after FINGERPRINT_TIMEOUT_MS if no finger is detected.
 void handleFingerprintInput() {
   if (millis() - stateEnteredAt >= FINGERPRINT_TIMEOUT_MS) {
     showError("Scan timeout");
@@ -371,20 +453,25 @@ void handleFingerprintInput() {
   }
 
   uint8_t p = finger.getImage();
-  if (p == FINGERPRINT_NOFINGER) return;  // no finger yet, keep waiting
+  if (p == FINGERPRINT_NOFINGER) return;  // no finger present yet; keep polling
   if (p != FINGERPRINT_OK) {
     showError("Sensor error");
     return;
   }
 
+  // Convert image to feature template
   p = finger.image2Tz();
   if (p != FINGERPRINT_OK) {
     showError("Image error");
     return;
   }
 
+  // Search stored templates for a match
   p = finger.fingerSearch();
   if (p == FINGERPRINT_OK && finger.confidence >= 30) {
+    // Confidence threshold of 30 is intentionally low for consumer-grade sensors.
+    // Enrolling the same finger at multiple angles across separate ID slots
+    // improves match reliability without raising the threshold.
     Serial.print(F("Admin fingerprint matched. ID: "));
     Serial.println(finger.fingerID);
     enterState(S_ENTERING_ADMIN_NUMBER);
@@ -393,29 +480,38 @@ void handleFingerprintInput() {
   }
 }
 
-// --- Business Logic ---
+// =============================================================================
+// Business Logic
+// =============================================================================
 
+// Checks whether the entered student number has an existing checkout record.
+// If no record exists, the student is signing out -> go to S_ENTERING_CN_OUT.
+// If a record exists, the student is returning a CB -> go to S_ENTERING_CN_IN.
+// The student must type the CB number themselves in both branches; there is no
+// auto-fill of currentCN here because handleCNInput() always overwrites it from
+// inputBuffer before calling confirmSignIn().
 void checkOpenRecord() {
   long studentNum = strtol(currentStudentNumber, NULL, 10);
 
   int openCN = -1;
   for (int i = 0; i < MAX_CHROMEBOOKS; i++) {
     if (checkoutRecords[i] == studentNum) {
-      openCN = i + 1;
+      openCN = i + 1;  // convert 0-based index to 1-based CB number
       break;
     }
   }
 
   if (openCN == -1) {
-    // No open record: student is signing out a Chromebook
+    // No open record: this student does not currently have a CB checked out
     enterState(S_ENTERING_CN_OUT);
   } else {
-    // Open record found: student is returning their Chromebook
-    itoa(openCN, currentCN, 10);
+    // Open record found: student is returning a CB
     enterState(S_ENTERING_CN_IN);
   }
 }
 
+// Validates and commits a sign-out: assigns studentNum to the chosen CB slot.
+// Fails if the CB number is out of range or the slot is already taken.
 void confirmSignOut() {
   int cn = atoi(currentCN);
   long studentNum = strtol(currentStudentNumber, NULL, 10);
@@ -426,12 +522,14 @@ void confirmSignOut() {
   }
 
   if (checkoutRecords[cn - 1] != 0) {
+    // Another student already has this CB checked out
     showError("CB unavailable");
     return;
   }
 
   checkoutRecords[cn - 1] = studentNum;
   saveRecord(cn - 1);
+
   Serial.print(F("Signed out: Student "));
   Serial.print(studentNum);
   Serial.print(F(" -> CB "));
@@ -440,6 +538,8 @@ void confirmSignOut() {
   enterState(S_SIGN_OUT_SUCCESS);
 }
 
+// Validates and commits a sign-in: clears the CB slot if it matches studentNum.
+// Fails if the CB number is out of range or the record does not match.
 void confirmSignIn() {
   int cn = atoi(currentCN);
   long studentNum = strtol(currentStudentNumber, NULL, 10);
@@ -450,12 +550,14 @@ void confirmSignIn() {
   }
 
   if (checkoutRecords[cn - 1] != studentNum) {
+    // Either the slot is empty or it belongs to a different student
     showError("No match found");
     return;
   }
 
   checkoutRecords[cn - 1] = 0;
   saveRecord(cn - 1);
+
   Serial.print(F("Signed in: CB "));
   Serial.print(cn);
   Serial.print(F(" from Student "));
@@ -464,9 +566,12 @@ void confirmSignIn() {
   enterState(S_SIGN_IN_SUCCESS);
 }
 
+// Assigns the admin's number to every currently available (0) CB slot.
+// Only free slots are touched; CBs already checked out by students are skipped.
 void processBulkSignOut() {
   long adminNum = strtol(currentAdminNumber, NULL, 10);
   int count = 0;
+
   for (int i = 0; i < MAX_CHROMEBOOKS; i++) {
     if (checkoutRecords[i] == 0) {
       checkoutRecords[i] = adminNum;
@@ -474,18 +579,23 @@ void processBulkSignOut() {
       count++;
     }
   }
+
   lastBulkCount = count;
   Serial.print(F("Bulk sign-out by admin "));
   Serial.print(adminNum);
   Serial.print(F(": "));
   Serial.print(count);
   Serial.println(F(" CBs signed out."));
+
   enterState(S_BULK_COMPLETE);
 }
 
+// Clears every CB slot that is currently assigned to the admin's number.
+// Shows an error if none are found (prevents a silent 0-count success).
 void processBulkSignIn() {
   long adminNum = strtol(currentAdminNumber, NULL, 10);
   int count = 0;
+
   for (int i = 0; i < MAX_CHROMEBOOKS; i++) {
     if (checkoutRecords[i] == adminNum) {
       checkoutRecords[i] = 0;
@@ -493,43 +603,65 @@ void processBulkSignIn() {
       count++;
     }
   }
+
   if (count == 0) {
+    // No CBs are currently assigned to this admin number
     showError("No CBs found");
     return;
   }
+
   lastBulkCount = count;
   Serial.print(F("Bulk sign-in by admin "));
   Serial.print(adminNum);
   Serial.print(F(": "));
   Serial.print(count);
   Serial.println(F(" CBs returned."));
+
   enterState(S_BULK_IN_COMPLETE);
 }
 
+// Copies msg into errorMessage and transitions to the error display state.
+// errorMessage is capped at 16 chars to fit LCD line 2.
 void showError(const char* msg) {
   strncpy(errorMessage, msg, 16);
   errorMessage[16] = '\0';
   enterState(S_ERROR_DISPLAY);
 }
 
-// --- State Transition ---
+// =============================================================================
+// State Transition
+// =============================================================================
 
+// Central state transition function. Always call this instead of assigning
+// currentState directly so that the timestamp, inputBuffer, serial flush,
+// and LCD update all happen consistently on every transition.
 void enterState(State newState) {
-  currentState = newState;
+  currentState   = newState;
   stateEnteredAt = millis();
   inputBuffer[0] = '\0';
-  // Flush stale SoftwareSerial bytes so fingerSearch() starts clean each time
+
+  // Flush any stale bytes that accumulated in the SoftwareSerial RX buffer
+  // while the sensor was idle. Without this, fingerSearch() may misread a
+  // leftover frame from a prior scan and immediately deny access.
   if (newState == S_WAITING_FOR_FINGERPRINT) {
     while (fingerprintSerial.available()) fingerprintSerial.read();
   }
+
   updateLCD();
 }
 
-// --- Display ---
+// =============================================================================
+// Display
+// =============================================================================
 
+// Redraws the entire LCD for the current state.
+// Called once per state transition by enterState().
+// Colors: green = idle/input/success, orange = sign-out, blue = sign-in,
+//         red = error, purple = admin flow.
 void updateLCD() {
   lcd.clear();
   switch (currentState) {
+
     case S_IDLE:
       lcd.setRGB(0, 255, 0);
       lcd.setCursor(0, 0);
@@ -545,7 +677,7 @@ void updateLCD() {
       break;
 
     case S_ENTERING_CN_OUT:
-      lcd.setRGB(255, 165, 0);
+      lcd.setRGB(255, 165, 0);  // orange
       lcd.setCursor(0, 0);
       lcd.print(F("Sign OUT"));
       lcd.setCursor(0, 1);
@@ -553,7 +685,7 @@ void updateLCD() {
       break;
 
     case S_ENTERING_CN_IN:
-      lcd.setRGB(0, 100, 255);
+      lcd.setRGB(0, 100, 255);  // blue
       lcd.setCursor(0, 0);
       lcd.print(F("Sign IN"));
       lcd.setCursor(0, 1);
@@ -579,7 +711,7 @@ void updateLCD() {
       break;
 
     case S_ERROR_DISPLAY:
-      lcd.setRGB(255, 0, 0);
+      lcd.setRGB(255, 0, 0);  // red
       lcd.setCursor(0, 0);
       lcd.print(F("Error:"));
       lcd.setCursor(0, 1);
@@ -587,7 +719,7 @@ void updateLCD() {
       break;
 
     case S_WAITING_FOR_FINGERPRINT:
-      lcd.setRGB(128, 0, 128);
+      lcd.setRGB(128, 0, 128);  // purple
       lcd.setCursor(0, 0);
       lcd.print(F("Admin: scan"));
       lcd.setCursor(0, 1);
@@ -649,9 +781,12 @@ void updateLCD() {
   }
 }
 
+// Refreshes only the input line (line 2) while a digit is being typed.
+// Clears the line first to erase any previous content, then reprints inputBuffer.
+// Called after each keypress in input states to avoid full lcd.clear() flicker.
 void updateLCDInput() {
   lcd.setCursor(0, 1);
-  lcd.print(F("                "));
+  lcd.print(F("                "));  // 16 spaces to blank the line
   lcd.setCursor(0, 1);
   lcd.print(inputBuffer);
 }
