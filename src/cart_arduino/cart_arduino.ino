@@ -714,7 +714,13 @@ void updateLCD() {
     case S_IDLE:
       lcd.setRGB(0, 255, 0);
       lcd.setCursor(0, 0);
-      lcd.print(F("Enter student #"));
+      if (cartMode == 1) {
+        lcd.print(F("Bulk cart"));
+        lcd.setCursor(0, 1);
+        lcd.print(F("Admin accs only"));
+      } else {
+        lcd.print(F("Enter student #"));
+      }
       break;
 
     case S_ENTERING_STUDENT_NUMBER:
