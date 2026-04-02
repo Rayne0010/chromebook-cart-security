@@ -59,6 +59,13 @@
  *     calling confirmSignIn(), so the pre-fill had no effect.
  *   - handleCNInput() now shows an "Enter CB #" error if # is pressed while
  *     the input buffer is empty, instead of silently ignoring the keypress.
+ *   - Cart mode added: each cart is either INDIVIDUAL (students sign out CBs
+ *     one at a time; bulk ops blocked) or BULK (only admin bulk sign-out/in;
+ *     student individual sign-out blocked with "Bulk cart only" error).
+ *     Mode is stored in EEPROM at byte 124, defaults to INDIVIDUAL on first
+ *     boot, and is toggled by pressing 1 in the admin menu. The admin menu
+ *     LCD now shows the current mode on line 0 and includes 1:Md in the key
+ *     guide on line 1.
  *
  * Team: Julian D., Ethan A., Lennon F. - TEJ4M
  */
@@ -137,9 +144,16 @@ long checkoutRecords[MAX_CHROMEBOOKS];
 //   Bytes   0-119: checkoutRecords (30 longs x 4 bytes each)
 //   Bytes 120-123: magic number (used to detect whether EEPROM has been
 //                  initialized; avoids treating garbage as valid records)
-const int EEPROM_BASE_ADDR  = 0;
-const int EEPROM_MAGIC_ADDR = MAX_CHROMEBOOKS * sizeof(long);  // = 120
-const long EEPROM_MAGIC     = 12345678L;
+//   Byte    124:   cartMode (0 = individual, 1 = bulk)
+const int EEPROM_BASE_ADDR      = 0;
+const int EEPROM_MAGIC_ADDR     = MAX_CHROMEBOOKS * sizeof(long);  // = 120
+const long EEPROM_MAGIC         = 12345678L;
+const int EEPROM_CART_MODE_ADDR = EEPROM_MAGIC_ADDR + sizeof(long);  // = 124
+
+// Cart operating mode, persisted to EEPROM.
+// 0 = INDIVIDUAL: students sign CBs in/out one at a time; bulk ops blocked.
+// 1 = BULK: only admin bulk sign-out/in allowed; student individual flow blocked.
+byte cartMode = 0;
 
 // Input length constraints
 const int STUDENT_NUMBER_LENGTH = 9;  // exactly 9 digits
@@ -175,10 +189,16 @@ void saveRecord(int index) {
   EEPROM.put(EEPROM_BASE_ADDR + index * sizeof(long), checkoutRecords[index]);
 }
 
-// Load all checkout records from EEPROM on boot.
+// Write the current cartMode byte to EEPROM.
+// Called immediately after any admin toggle of cartMode.
+void saveCartMode() {
+  EEPROM.put(EEPROM_CART_MODE_ADDR, cartMode);
+}
+
+// Load all checkout records and cartMode from EEPROM on boot.
 // If the magic number is missing (first power-on or after a flash), all records
-// are initialized to 0 and the magic number is written so subsequent boots
-// load real data.
+// are initialized to 0, cartMode is set to INDIVIDUAL (0), and the magic number
+// is written so subsequent boots load real data.
 void loadRecords() {
   long magic;
   EEPROM.get(EEPROM_MAGIC_ADDR, magic);
@@ -188,13 +208,18 @@ void loadRecords() {
       checkoutRecords[i] = 0;
       EEPROM.put(EEPROM_BASE_ADDR + i * sizeof(long), checkoutRecords[i]);
     }
+    cartMode = 0;
+    EEPROM.put(EEPROM_CART_MODE_ADDR, cartMode);
     EEPROM.put(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
     Serial.println(F("EEPROM initialized."));
   } else {
-    // Normal boot: load previously saved records into RAM.
+    // Normal boot: load previously saved records and mode into RAM.
     for (int i = 0; i < MAX_CHROMEBOOKS; i++) {
       EEPROM.get(EEPROM_BASE_ADDR + i * sizeof(long), checkoutRecords[i]);
     }
+    EEPROM.get(EEPROM_CART_MODE_ADDR, cartMode);
+    // Guard against corrupted mode byte (anything other than 0 or 1)
+    if (cartMode != 0 && cartMode != 1) cartMode = 0;
     Serial.println(F("Records loaded from EEPROM."));
   }
 }
@@ -297,8 +322,14 @@ void loop() {
       break;
 
     case S_ADMIN_MENU:
-      // 2 = bulk sign-in, 3 = bulk sign-out, * = back to idle
-      if (key == '2') {
+      // 1 = toggle cart mode, 2 = bulk sign-in, 3 = bulk sign-out, * = back to idle
+      if (key == '1') {
+        cartMode = 1 - cartMode;  // toggle between 0 and 1
+        saveCartMode();
+        Serial.print(F("Cart mode set to: "));
+        Serial.println(cartMode == 1 ? F("BULK") : F("INDIVIDUAL"));
+        updateLCD();  // re-render menu to show new mode; don't reset state timer
+      } else if (key == '2') {
         enterState(S_BULK_IN_CONFIRM);
       } else if (key == '3') {
         enterState(S_BULK_CONFIRM);
@@ -491,6 +522,12 @@ void handleFingerprintInput() {
 // auto-fill of currentCN here because handleCNInput() always overwrites it from
 // inputBuffer before calling confirmSignIn().
 void checkOpenRecord() {
+  // Bulk-mode carts do not support individual student sign-out/sign-in.
+  if (cartMode == 1) {
+    showError("Bulk cart only");
+    return;
+  }
+
   long studentNum = strtol(currentStudentNumber, NULL, 10);
 
   int openCN = -1;
@@ -568,7 +605,13 @@ void confirmSignIn() {
 
 // Assigns the admin's number to every currently available (0) CB slot.
 // Only free slots are touched; CBs already checked out by students are skipped.
+// Blocked on individual-mode carts.
 void processBulkSignOut() {
+  if (cartMode == 0) {
+    showError("Individ. cart");
+    return;
+  }
+
   long adminNum = strtol(currentAdminNumber, NULL, 10);
   int count = 0;
 
@@ -592,7 +635,13 @@ void processBulkSignOut() {
 
 // Clears every CB slot that is currently assigned to the admin's number.
 // Shows an error if none are found (prevents a silent 0-count success).
+// Blocked on individual-mode carts.
 void processBulkSignIn() {
+  if (cartMode == 0) {
+    showError("Individ. cart");
+    return;
+  }
+
   long adminNum = strtol(currentAdminNumber, NULL, 10);
   int count = 0;
 
@@ -737,9 +786,16 @@ void updateLCD() {
     case S_ADMIN_MENU:
       lcd.setRGB(128, 0, 128);
       lcd.setCursor(0, 0);
-      lcd.print(F("ADMIN MENU"));
+      // Line 0 shows current mode so admin always knows what the cart is set to.
+      // "ADMIN [INDIVID]" = 15 chars, "ADMIN [BULK]   " = 15 chars -- both fit.
+      if (cartMode == 1) {
+        lcd.print(F("ADMIN [BULK]   "));
+      } else {
+        lcd.print(F("ADMIN [INDIVID]"));
+      }
       lcd.setCursor(0, 1);
-      lcd.print(F("2:In 3:Out *:Bk"));
+      // 1:Md toggles mode, 2:In bulk sign-in, 3:Out bulk sign-out, * cancels
+      lcd.print(F("1:Md 2:In 3:Out"));
       break;
 
     case S_BULK_CONFIRM:
