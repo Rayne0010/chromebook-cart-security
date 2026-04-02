@@ -66,6 +66,12 @@
  *     boot, and is toggled by pressing 1 in the admin menu. The admin menu
  *     LCD now shows the current mode on line 0 and includes 1:Md in the key
  *     guide on line 1.
+ *   - Admin number entry step removed. fingerID returned by fingerSearch() is
+ *     now looked up in a compile-time adminTable[] that maps each enrolled
+ *     slot ID to its owner's admin number. Multiple slot IDs can share the
+ *     same admin number to cover multiple enrollment angles. If the matched
+ *     fingerID is not in the table, access is denied. S_ENTERING_ADMIN_NUMBER
+ *     and handleAdminNumberInput() have been removed.
  *
  * Team: Julian D., Ethan A., Lennon F. - TEJ4M
  */
@@ -120,7 +126,6 @@ enum State {
   S_SIGN_IN_SUCCESS,         // confirmation message shown for 3s then -> IDLE
   S_ERROR_DISPLAY,           // error message shown for 3s then -> IDLE
   S_WAITING_FOR_FINGERPRINT, // admin flow: waiting for finger on sensor
-  S_ENTERING_ADMIN_NUMBER,   // admin flow: typing 9-digit staff number
   S_ADMIN_MENU,              // admin flow: choose bulk-out (3), bulk-in (2), or back (*)
   S_BULK_CONFIRM,            // admin flow: confirm sign-out of entire cart
   S_BULK_COMPLETE,           // admin flow: bulk sign-out done, shown for 3s
@@ -157,7 +162,6 @@ byte cartMode = 0;
 
 // Input length constraints
 const int STUDENT_NUMBER_LENGTH = 9;  // exactly 9 digits
-const int ADMIN_NUMBER_LENGTH   = 9;  // same format as student number
 const int CN_LENGTH             = 2;  // Chromebook numbers 1-30 (1 or 2 digits)
 
 // Timeout durations (milliseconds)
@@ -222,6 +226,47 @@ void loadRecords() {
     if (cartMode != 0 && cartMode != 1) cartMode = 0;
     Serial.println(F("Records loaded from EEPROM."));
   }
+}
+
+// =============================================================================
+// Admin Fingerprint Lookup Table
+// =============================================================================
+
+// Maps each enrolled fingerprint slot ID to the corresponding admin number.
+// Each admin should be enrolled at multiple angles across separate slot IDs
+// to reduce false negatives; all those slot IDs map to the same adminNumber.
+//
+// HOW TO ADD AN ADMIN:
+//   1. Enroll their finger 2-3 times using the enrollment sketch, noting the
+//      slot IDs assigned (e.g. 1, 2, 3 for angle variations).
+//   2. Add one row per slot ID below, all pointing to the same adminNumber.
+//   3. Re-upload this sketch.
+//
+// fingerID values match the slot IDs written during enrollment (1-indexed).
+struct AdminEntry {
+  uint8_t fingerID;    // slot ID on the sensor (as returned by fingerSearch())
+  long    adminNumber; // 9-digit staff number this fingerID belongs to
+};
+
+const AdminEntry adminTable[] = {
+  // --- Example admin entries (replace with real data before deployment) ---
+  { 1, 100000001L },  // Staff A - angle 1
+  { 2, 100000001L },  // Staff A - angle 2
+  { 3, 100000001L },  // Staff A - angle 3
+  { 4, 100000002L },  // Staff B - angle 1
+  { 5, 100000002L },  // Staff B - angle 2
+  { 6, 100000002L },  // Staff B - angle 3
+};
+const int ADMIN_TABLE_SIZE = sizeof(adminTable) / sizeof(adminTable[0]);
+
+// Returns the adminNumber for the given fingerID, or 0 if not found.
+long lookupAdminNumber(uint8_t fpID) {
+  for (int i = 0; i < ADMIN_TABLE_SIZE; i++) {
+    if (adminTable[i].fingerID == fpID) {
+      return adminTable[i].adminNumber;
+    }
+  }
+  return 0;
 }
 
 // =============================================================================
@@ -312,15 +357,6 @@ void loop() {
       handleFingerprintInput();
       break;
 
-    case S_ENTERING_ADMIN_NUMBER:
-      // Auto-cancel if admin walks away mid-entry without finishing.
-      if (millis() - stateEnteredAt >= INPUT_TIMEOUT_MS) {
-        enterState(S_IDLE);
-        break;
-      }
-      handleAdminNumberInput(key);
-      break;
-
     case S_ADMIN_MENU:
       // 1 = toggle cart mode, 2 = bulk sign-in, 3 = bulk sign-out, * = back to idle
       if (key == '1') {
@@ -406,37 +442,6 @@ void handleStudentNumberInput(char key) {
   }
 }
 
-// Accumulates keypad digits into inputBuffer for the admin staff number.
-// Behaves identically to handleStudentNumberInput() but targets currentAdminNumber
-// and transitions to S_ADMIN_MENU on completion.
-// * cancels and returns to idle.
-void handleAdminNumberInput(char key) {
-  if (!key) return;
-
-  if (key == '*') {
-    enterState(S_IDLE);
-    return;
-  }
-
-  if (key != '#') {
-    int len = strlen(inputBuffer);
-    if (len < ADMIN_NUMBER_LENGTH) {
-      inputBuffer[len]     = key;
-      inputBuffer[len + 1] = '\0';
-      updateLCDInput();
-    }
-  }
-
-  // Auto-submit once 9 digits have been entered
-  if (strlen(inputBuffer) == ADMIN_NUMBER_LENGTH) {
-    strncpy(currentAdminNumber, inputBuffer, 10);
-    inputBuffer[0] = '\0';
-    Serial.print(F("Admin number entered: "));
-    Serial.println(currentAdminNumber);
-    enterState(S_ADMIN_MENU);
-  }
-}
-
 // Handles Chromebook number entry for both sign-out and sign-in.
 // # submits the entered digits. * cancels and returns to idle.
 // Pressing # with an empty buffer shows an error instead of silently ignoring it.
@@ -475,7 +480,8 @@ void handleCNInput(char key) {
 }
 
 // Polls the fingerprint sensor once per loop tick while in S_WAITING_FOR_FINGERPRINT.
-// On a confident match (confidence >= 30), transitions to S_ENTERING_ADMIN_NUMBER.
+// On a confident match, looks up the fingerID in adminTable to resolve the admin
+// number, then jumps directly to S_ADMIN_MENU. No manual number entry required.
 // Times out after FINGERPRINT_TIMEOUT_MS if no finger is detected.
 void handleFingerprintInput() {
   if (millis() - stateEnteredAt >= FINGERPRINT_TIMEOUT_MS) {
@@ -500,12 +506,24 @@ void handleFingerprintInput() {
   // Search stored templates for a match
   p = finger.fingerSearch();
   if (p == FINGERPRINT_OK && finger.confidence >= 30) {
-    // Confidence threshold of 30 is intentionally low for consumer-grade sensors.
-    // Enrolling the same finger at multiple angles across separate ID slots
-    // improves match reliability without raising the threshold.
-    Serial.print(F("Admin fingerprint matched. ID: "));
-    Serial.println(finger.fingerID);
-    enterState(S_ENTERING_ADMIN_NUMBER);
+    long adminNum = lookupAdminNumber(finger.fingerID);
+    if (adminNum == 0) {
+      // Fingerprint matched a sensor slot but is not in the admin table.
+      // This means the slot was enrolled but not registered here -- deny access.
+      Serial.print(F("Fingerprint ID "));
+      Serial.print(finger.fingerID);
+      Serial.println(F(" not in admin table."));
+      showError("Not registered");
+      return;
+    }
+    // Populate currentAdminNumber from the lookup result so bulk functions
+    // can use it via strtol() without any other changes.
+    ltoa(adminNum, currentAdminNumber, 10);
+    Serial.print(F("Admin matched. FP ID: "));
+    Serial.print(finger.fingerID);
+    Serial.print(F(" -> Admin: "));
+    Serial.println(currentAdminNumber);
+    enterState(S_ADMIN_MENU);
   } else {
     showError("Access denied");
   }
@@ -779,14 +797,6 @@ void updateLCD() {
       lcd.print(F("Admin: scan"));
       lcd.setCursor(0, 1);
       lcd.print(F("fingerprint..."));
-      break;
-
-    case S_ENTERING_ADMIN_NUMBER:
-      lcd.setRGB(128, 0, 128);
-      lcd.setCursor(0, 0);
-      lcd.print(F("Admin #:"));
-      lcd.setCursor(0, 1);
-      lcd.print(inputBuffer);
       break;
 
     case S_ADMIN_MENU:
