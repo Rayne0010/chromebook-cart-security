@@ -106,9 +106,9 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 rgb_lcd lcd;
 
 // --- Fingerprint Sensor ---
-// Adafruit fingerprint sensor on SoftwareSerial: RX = pin 9, TX = pin 10.
+// Adafruit fingerprint sensor on SoftwareSerial: RX = pin A0, TX = pin A1.
 // Templates are stored on the sensor's onboard flash, not in Arduino RAM.
-SoftwareSerial fingerprintSerial(9, 10);
+SoftwareSerial fingerprintSerial(A0, A1);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerprintSerial);
 
 // =============================================================================
@@ -256,6 +256,9 @@ const AdminEntry adminTable[] = {
   { 4, 100000002L },  // Staff B - angle 1
   { 5, 100000002L },  // Staff B - angle 2
   { 6, 100000002L },  // Staff B - angle 3
+  { 7, 100000003L },  // Staff C - angle 1
+  { 8, 100000003L },  // Staff C - angle 2
+  { 9, 100000003L },  // Staff C - angle 3
 };
 const int ADMIN_TABLE_SIZE = sizeof(adminTable) / sizeof(adminTable[0]);
 
