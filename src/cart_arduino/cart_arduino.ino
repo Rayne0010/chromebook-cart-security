@@ -10,15 +10,15 @@
  *   - Fingerprint sensor for admin access and bulk cart sign-out/sign-in
  *
  * States (Primary Scope):
- *   S_IDLE -> S_ENTERING_STUDENT_NUMBER -> VALIDATING_STUDENT
- *   -> CHECK_OPEN_RECORD -> S_ENTERING_CN_OUT or S_ENTERING_CN_IN
- *   -> CONFIRM -> SUCCESS / ERROR
+ *   S_IDLE -> S_ENTERING_STUDENT_NUMBER
+ *   -> S_ENTERING_CN_OUT or S_ENTERING_CN_IN
+ *   -> S_SIGN_OUT_SUCCESS / S_SIGN_IN_SUCCESS / S_ERROR_DISPLAY -> S_IDLE
  *
  * States (Secondary Scope - Admin):
  *   S_IDLE --(*)--> S_WAITING_FOR_FINGERPRINT
- *   -> S_ENTERING_ADMIN_NUMBER -> S_ADMIN_MENU
- *   -> S_BULK_CONFIRM -> S_BULK_COMPLETE
- *   -> S_BULK_IN_CONFIRM -> S_BULK_IN_COMPLETE
+ *   -> S_ADMIN_MENU
+ *   -> S_BULK_CONFIRM -> S_BULK_COMPLETE -> S_IDLE
+ *   -> S_BULK_IN_CONFIRM -> S_BULK_IN_COMPLETE -> S_IDLE
  *
  * Fix notes:
  *   - Removed recursive enterState() calls from inside updateLCD().
@@ -50,8 +50,8 @@
  *   - All string literals wrapped in F() macro to store them in flash instead
  *     of RAM.
  *   - Input timeout added: S_ENTERING_STUDENT_NUMBER, S_ENTERING_CN_OUT,
- *     S_ENTERING_CN_IN, and S_ENTERING_ADMIN_NUMBER auto-reset to S_IDLE
- *     after INPUT_TIMEOUT_MS of inactivity.
+ *     and S_ENTERING_CN_IN auto-reset to S_IDLE after INPUT_TIMEOUT_MS
+ *     of inactivity.
  *   - Bulk op count now displayed on LCD line 2 of S_BULK_COMPLETE and
  *     S_BULK_IN_COMPLETE so the admin can confirm how many CBs were processed.
  *   - Dead itoa() pre-fill of currentCN removed from checkOpenRecord().
@@ -173,7 +173,7 @@ const unsigned long MESSAGE_DISPLAY_DURATION_MS = 3000; // 3s for success/error 
 // Sizes include the null terminator.
 char inputBuffer[10]          = "";  // active typing buffer (max 9 digits + \0)
 char currentStudentNumber[10] = "";  // student number confirmed this session
-char currentAdminNumber[10]   = "";  // admin number confirmed after fingerprint
+long currentAdminNum          = 0;   // admin number resolved from fingerprint lookup
 char currentCN[3]             = "";  // Chromebook number confirmed this session (max 2 digits + \0)
 char errorMessage[17]         = "";  // error text for LCD line 2 (max 16 chars + \0)
 
@@ -519,13 +519,12 @@ void handleFingerprintInput() {
       showError("Not registered");
       return;
     }
-    // Populate currentAdminNumber from the lookup result so bulk functions
-    // can use it via strtol() without any other changes.
-    ltoa(adminNum, currentAdminNumber, 10);
+    // Store the resolved admin number directly as a long.
+    currentAdminNum = adminNum;
     Serial.print(F("Admin matched. FP ID: "));
     Serial.print(finger.fingerID);
     Serial.print(F(" -> Admin: "));
-    Serial.println(currentAdminNumber);
+    Serial.println(currentAdminNum);
     enterState(S_ADMIN_MENU);
   } else {
     showError("Access denied");
@@ -633,7 +632,7 @@ void processBulkSignOut() {
     return;
   }
 
-  long adminNum = strtol(currentAdminNumber, NULL, 10);
+  long adminNum = currentAdminNum;
   int count = 0;
 
   for (int i = 0; i < MAX_CHROMEBOOKS; i++) {
@@ -663,7 +662,7 @@ void processBulkSignIn() {
     return;
   }
 
-  long adminNum = strtol(currentAdminNumber, NULL, 10);
+  long adminNum = currentAdminNum;
   int count = 0;
 
   for (int i = 0; i < MAX_CHROMEBOOKS; i++) {
