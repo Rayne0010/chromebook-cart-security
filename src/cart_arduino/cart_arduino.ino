@@ -8,11 +8,13 @@
  *   - Sign-in: clear association for returned Chromebook
  *   - LCD display for user prompts and feedback
  *   - Fingerprint sensor for admin access and bulk cart sign-out/sign-in
+ *   - USB barcode scanner: confirms correct CB taken after sign-out
  *
  * States (Primary Scope):
  *   S_IDLE -> S_ENTERING_STUDENT_NUMBER
  *   -> S_ENTERING_CN_OUT or S_ENTERING_CN_IN
- *   -> S_SIGN_OUT_SUCCESS / S_SIGN_IN_SUCCESS / S_ERROR_DISPLAY -> S_IDLE
+ *   -> S_SCAN_TIMER_ACTIVE (barcode window) -> S_SIGN_OUT_SUCCESS / S_BARCODE_ALARM
+ *   -> S_SIGN_IN_SUCCESS / S_ERROR_DISPLAY -> S_IDLE
  *
  * States (Secondary Scope - Admin):
  *   S_IDLE --(*)--> S_WAITING_FOR_FINGERPRINT
@@ -59,9 +61,9 @@
  *     calling confirmSignIn(), so the pre-fill had no effect.
  *   - handleCNInput() now shows an "Enter CB #" error if # is pressed while
  *     the input buffer is empty, instead of silently ignoring the keypress.
- *   - Cart mode added: each cart is either INDIVIDUAL (students sign out CBs
- *     one at a time; bulk ops blocked) or BULK (only admin bulk sign-out/in;
- *     student individual sign-out blocked with "Bulk cart only" error).
+ *   - Cart mode added: each cart is either INDIVIDUAL (per-student sign-out;
+ *     bulk ops blocked) or BULK (only admin bulk sign-out/in; student
+ *     individual sign-out blocked with "Bulk cart only" error).
  *     Mode is stored in EEPROM at byte 124, defaults to INDIVIDUAL on first
  *     boot, and is toggled by pressing 1 in the admin menu. The admin menu
  *     LCD now shows the current mode on line 0 and includes 1:Md in the key
@@ -72,16 +74,82 @@
  *     same admin number to cover multiple enrollment angles. If the matched
  *     fingerID is not in the table, access is denied. S_ENTERING_ADMIN_NUMBER
  *     and handleAdminNumberInput() have been removed.
+ *   - USB barcode scanner integration added (secondary scope).
+ *     USB Host Shield (MAX3421E, ARCELI) with USB Host Shield Library 2.0.
+ *     Barcode scanner enumerates as a HID keyboard device. After a successful
+ *     student sign-out, the system enters S_SCAN_TIMER_ACTIVE and waits up to
+ *     SCAN_TIMEOUT_MS for the student to scan the Chromebook barcode.
+ *     A valid scan (barcode matches currentCN) advances to S_SIGN_OUT_SUCCESS.
+ *     An invalid scan or timeout advances to S_BARCODE_ALARM.
+ *     KbdRptParser::OnKeyDown() accumulates HID key events into barcodeBuffer
+ *     and sets barcodeReady = true on Enter (HID keycode 0x28).
+ *     barcodeBuffer and barcodeReady are reset each time S_SCAN_TIMER_ACTIVE
+ *     is entered. Usb.Task() is called every loop iteration regardless of
+ *     state so the USB stack stays alive.
  *
  * Team: Julian D., Ethan A., Lennon F. - TEJ4M
  */
 
+#include <SPI.h>
+#include <usbhub.h>
+#include <hidboot.h>
 #include <Keypad.h>
 #include <Wire.h>
 #include <rgb_lcd.h>
 #include <SoftwareSerial.h>
 #include <Adafruit_Fingerprint.h>
 #include <EEPROM.h>
+
+// =============================================================================
+// USB Barcode Scanner Setup
+// =============================================================================
+
+// USB Host Shield (MAX3421E) uses SPI with INT on pin 9, SS on pin 10.
+// HIDBoot configures the attached USB device in Boot-protocol keyboard mode,
+// which all HID keyboards (including barcode scanners) must support.
+USB                                     Usb;
+USBHub                                  Hub(&Usb);
+HIDBoot<USB_HID_PROTOCOL_KEYBOARD>      HidKeyboard(&Usb);
+
+// barcodeBuffer: accumulates characters received from the scanner.
+// Sized for safety; CB numbers are at most 2 digits, but scanners may send
+// a longer asset tag string depending on how the barcodes were printed.
+// Adjust BARCODE_MAX_LEN and the validation logic in validateBarcode() if your
+// barcodes contain more than just the CB number.
+const int BARCODE_MAX_LEN = 16;
+char      barcodeBuffer[BARCODE_MAX_LEN + 1] = "";
+bool      barcodeReady                        = false;
+
+// KbdRptParser: subclass of KeyboardReportParser that accumulates keystrokes
+// from the barcode scanner into barcodeBuffer and sets barcodeReady on Enter.
+// OnKeyDown() is called by the USB Host Shield library once per key event.
+class KbdRptParser : public KeyboardReportParser {
+protected:
+  void OnKeyDown(uint8_t mod, uint8_t key) override;
+};
+
+void KbdRptParser::OnKeyDown(uint8_t mod, uint8_t key) {
+  if (key == 0x28) {
+    // Enter key: barcode transmission complete.
+    barcodeReady = true;
+    return;
+  }
+
+  // Convert HID keycode to ASCII character using the library helper.
+  // OemToAscii handles modifier keys (Shift) and returns 0 for non-printable keys.
+  uint8_t c = OemToAscii(mod, key);
+  if (c == 0) return;  // non-printable key; ignore
+
+  int len = strlen(barcodeBuffer);
+  if (len < BARCODE_MAX_LEN) {
+    barcodeBuffer[len]     = (char)c;
+    barcodeBuffer[len + 1] = '\0';
+  }
+  // If the buffer is full, additional characters are silently dropped.
+  // A real barcode should never overflow BARCODE_MAX_LEN.
+}
+
+KbdRptParser BarcodeParser;
 
 // =============================================================================
 // Hardware Setup
@@ -122,6 +190,8 @@ enum State {
   S_ENTERING_STUDENT_NUMBER, // student typing their 9-digit number
   S_ENTERING_CN_OUT,         // student typing Chromebook number to sign out
   S_ENTERING_CN_IN,          // student typing Chromebook number to sign in
+  S_SCAN_TIMER_ACTIVE,       // barcode window: student must scan CB within timeout
+  S_BARCODE_ALARM,           // barcode scan timed out or barcode did not match
   S_SIGN_OUT_SUCCESS,        // confirmation message shown for 3s then -> IDLE
   S_SIGN_IN_SUCCESS,         // confirmation message shown for 3s then -> IDLE
   S_ERROR_DISPLAY,           // error message shown for 3s then -> IDLE
@@ -150,10 +220,10 @@ long checkoutRecords[MAX_CHROMEBOOKS];
 //   Bytes 120-123: magic number (used to detect whether EEPROM has been
 //                  initialized; avoids treating garbage as valid records)
 //   Byte    124:   cartMode (0 = individual, 1 = bulk)
-const int EEPROM_BASE_ADDR      = 0;
-const int EEPROM_MAGIC_ADDR     = MAX_CHROMEBOOKS * sizeof(long);  // = 120
-const long EEPROM_MAGIC         = 12345678L;
-const int EEPROM_CART_MODE_ADDR = EEPROM_MAGIC_ADDR + sizeof(long);  // = 124
+const int  EEPROM_BASE_ADDR      = 0;
+const int  EEPROM_MAGIC_ADDR     = MAX_CHROMEBOOKS * sizeof(long);  // = 120
+const long EEPROM_MAGIC          = 12345678L;
+const int  EEPROM_CART_MODE_ADDR = EEPROM_MAGIC_ADDR + sizeof(long);  // = 124
 
 // Cart operating mode, persisted to EEPROM.
 // 0 = INDIVIDUAL: students sign CBs in/out one at a time; bulk ops blocked.
@@ -165,9 +235,10 @@ const int STUDENT_NUMBER_LENGTH = 9;  // exactly 9 digits
 const int CN_LENGTH             = 2;  // Chromebook numbers 1-30 (1 or 2 digits)
 
 // Timeout durations (milliseconds)
-const unsigned long FINGERPRINT_TIMEOUT_MS    = 10000;  // 10s to scan finger
-const unsigned long INPUT_TIMEOUT_MS          = 15000;  // 15s idle on any input state
-const unsigned long MESSAGE_DISPLAY_DURATION_MS = 3000; // 3s for success/error messages
+const unsigned long FINGERPRINT_TIMEOUT_MS      = 10000;  // 10s to scan finger
+const unsigned long INPUT_TIMEOUT_MS            = 15000;  // 15s idle on any input state
+const unsigned long MESSAGE_DISPLAY_DURATION_MS = 3000;   // 3s for success/error messages
+const unsigned long SCAN_TIMEOUT_MS             = 30000;  // 30s to scan barcode after sign-out
 
 // Fixed-size char arrays replace String objects to avoid heap fragmentation.
 // Sizes include the null terminator.
@@ -294,6 +365,17 @@ void setup() {
     Serial.println(F("Fingerprint sensor not found - admin mode unavailable."));
   }
 
+  // USB Host Shield initialization. Usb.Init() returns -1 on failure (e.g.,
+  // shield not connected or SPI wiring issue). The barcode scanner will not
+  // work if init fails, but the rest of the system continues normally.
+  if (Usb.Init() == -1) {
+    Serial.println(F("USB Host Shield init failed - barcode scanner unavailable."));
+  } else {
+    Serial.println(F("USB Host Shield ready."));
+  }
+  // Attach our parser to HID interface 0 (the keyboard boot interface).
+  HidKeyboard.SetReportParser(0, &BarcodeParser);
+
   enterState(S_IDLE);
   Serial.println(F("Cart system ready."));
 }
@@ -303,6 +385,11 @@ void setup() {
 // =============================================================================
 
 void loop() {
+  // Drive the USB stack every iteration regardless of current state.
+  // Without this call the shield will not enumerate the scanner or deliver
+  // key events to BarcodeParser.
+  Usb.Task();
+
   // Poll the keypad once per loop iteration. Returns '\0' if no key is pressed.
   char key = keypad.getKey();
 
@@ -340,6 +427,31 @@ void loop() {
         break;
       }
       handleCNInput(key);
+      break;
+
+    case S_SCAN_TIMER_ACTIVE:
+      // Wait for the barcode scanner to deliver a complete scan (barcodeReady),
+      // or time out after SCAN_TIMEOUT_MS and trigger the alarm.
+      // * allows an admin to cancel the window (e.g., scanner malfunction).
+      if (key == '*') {
+        enterState(S_BARCODE_ALARM);
+        break;
+      }
+      if (millis() - stateEnteredAt >= SCAN_TIMEOUT_MS) {
+        Serial.println(F("Barcode scan timeout."));
+        enterState(S_BARCODE_ALARM);
+        break;
+      }
+      if (barcodeReady) {
+        validateBarcode();
+      }
+      break;
+
+    case S_BARCODE_ALARM:
+      // Alarm stays on screen until * is pressed (admin intervention).
+      if (key == '*') {
+        enterState(S_IDLE);
+      }
       break;
 
     // These states just display a message and auto-return to idle after a delay.
@@ -532,6 +644,34 @@ void handleFingerprintInput() {
 }
 
 // =============================================================================
+// Barcode Validation
+// =============================================================================
+
+// Called from loop() once barcodeReady is set by BarcodeParser.
+// Compares the scanned barcode string to currentCN (the CB number that was
+// just signed out). A match advances to S_SIGN_OUT_SUCCESS; a mismatch
+// triggers S_BARCODE_ALARM.
+//
+// ASSUMPTION: barcodes on each Chromebook encode the CB number as a plain
+// digit string (e.g., CB 7 has a barcode that scans as "7"). If your barcodes
+// use a longer asset tag format, update this function to match accordingly.
+void validateBarcode() {
+  Serial.print(F("Barcode scanned: "));
+  Serial.println(barcodeBuffer);
+
+  if (strcmp(barcodeBuffer, currentCN) == 0) {
+    Serial.println(F("Barcode match: correct CB confirmed."));
+    enterState(S_SIGN_OUT_SUCCESS);
+  } else {
+    Serial.print(F("Barcode mismatch. Expected CB "));
+    Serial.print(currentCN);
+    Serial.print(F(", got: "));
+    Serial.println(barcodeBuffer);
+    enterState(S_BARCODE_ALARM);
+  }
+}
+
+// =============================================================================
 // Business Logic
 // =============================================================================
 
@@ -568,6 +708,8 @@ void checkOpenRecord() {
 }
 
 // Validates and commits a sign-out: assigns studentNum to the chosen CB slot.
+// On success, transitions to S_SCAN_TIMER_ACTIVE to wait for barcode confirmation
+// instead of going directly to S_SIGN_OUT_SUCCESS.
 // Fails if the CB number is out of range or the slot is already taken.
 void confirmSignOut() {
   int cn = atoi(currentCN);
@@ -590,9 +732,11 @@ void confirmSignOut() {
   Serial.print(F("Signed out: Student "));
   Serial.print(studentNum);
   Serial.print(F(" -> CB "));
-  Serial.println(cn);
+  Serial.print(cn);
+  Serial.println(F(" - awaiting barcode scan."));
 
-  enterState(S_SIGN_OUT_SUCCESS);
+  // Do NOT go to S_SIGN_OUT_SUCCESS yet; require barcode confirmation first.
+  enterState(S_SCAN_TIMER_ACTIVE);
 }
 
 // Validates and commits a sign-in: clears the CB slot if it matches studentNum.
@@ -703,7 +847,7 @@ void showError(const char* msg) {
 
 // Central state transition function. Always call this instead of assigning
 // currentState directly so that the timestamp, inputBuffer, serial flush,
-// and LCD update all happen consistently on every transition.
+// barcode buffer reset, and LCD update all happen consistently on every transition.
 void enterState(State newState) {
   currentState   = newState;
   stateEnteredAt = millis();
@@ -714,6 +858,13 @@ void enterState(State newState) {
   // leftover frame from a prior scan and immediately deny access.
   if (newState == S_WAITING_FOR_FINGERPRINT) {
     while (fingerprintSerial.available()) fingerprintSerial.read();
+  }
+
+  // Reset the barcode accumulator whenever entering the scan window so a stale
+  // result from a previous sign-out cannot carry over into a new one.
+  if (newState == S_SCAN_TIMER_ACTIVE) {
+    barcodeBuffer[0] = '\0';
+    barcodeReady     = false;
   }
 
   updateLCD();
@@ -765,6 +916,23 @@ void updateLCD() {
       lcd.print(F("Sign IN"));
       lcd.setCursor(0, 1);
       lcd.print(F("Enter CB #:"));
+      break;
+
+    case S_SCAN_TIMER_ACTIVE:
+      lcd.setRGB(255, 165, 0);  // orange: action required
+      lcd.setCursor(0, 0);
+      lcd.print(F("Scan CB barcode"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("CB #"));
+      lcd.print(currentCN);
+      break;
+
+    case S_BARCODE_ALARM:
+      lcd.setRGB(255, 0, 0);  // red
+      lcd.setCursor(0, 0);
+      lcd.print(F("ALARM: Bad scan"));
+      lcd.setCursor(0, 1);
+      lcd.print(F("*:Admin dismiss"));
       break;
 
     case S_SIGN_OUT_SUCCESS:
