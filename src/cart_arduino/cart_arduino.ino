@@ -113,13 +113,19 @@ public:
   }
 
 protected:
-  // Receives each ASCII character from the scanner. Enter (\r) signals done.
-  void OnKeyPressed(uint8_t key) override {
-    if (key == '\r') {
+  // Called by the library on each key press with the HID keycode and modifier.
+  // OemToAscii() converts HID keycode + modifier to an ASCII character.
+  // 0x28 is the HID Enter keycode, which signals end of barcode transmission.
+  void OnKeyDown(uint8_t mod, uint8_t key) override {
+    if (key == 0x28) {  // Enter
       buf[len] = '\0';
       ready    = true;
-    } else if (len < 31) {
-      buf[len++] = (char)key;
+      return;
+    }
+    uint8_t c = OemToAscii(mod, key);
+    if (c == 0) return;  // non-printable; ignore
+    if (len < 31) {
+      buf[len++] = (char)c;
     }
   }
 };
