@@ -685,8 +685,8 @@ void showError(const char* msg) {
 // State Transition
 // =============================================================================
 
-void enterState(CartState newState) {
-  currentState   = newState;
+void enterState(int newState) {
+  currentState   = (CartState)newState;
   stateEnteredAt = millis();
   inputBuffer[0] = '\0';
 
