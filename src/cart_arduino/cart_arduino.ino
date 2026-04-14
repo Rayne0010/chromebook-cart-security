@@ -644,29 +644,70 @@ void handleFingerprintInput() {
 }
 
 // =============================================================================
+// Chromebook Barcode Lookup Table
+// =============================================================================
+
+// Maps each Chromebook's physical asset-tag barcode to its CB number (1-30).
+// Barcodes are the full strings the scanner produces (e.g. "1H85392GMX").
+// Add one row per Chromebook. CB numbers must match the slot numbers students
+// enter on the keypad.
+//
+// HOW TO ADD A CHROMEBOOK:
+//   1. Scan the barcode with a terminal open and note the string it produces.
+//   2. Add a row below with that string and the CB number assigned to that device.
+//   3. Re-upload this sketch.
+struct ChromebookEntry {
+  const char* barcode;  // full barcode string as scanned
+  int         cbNumber; // CB number assigned to this device (1-30)
+};
+
+const ChromebookEntry chromebookTable[] = {
+  // --- Replace / extend with your real barcodes and CB numbers ---
+  { "1H85392GMX", 1 },  // CB 1
+  // { "BARCODE2",  2 },
+  // { "BARCODE3",  3 },
+  // ... add remaining CBs here
+};
+const int CHROMEBOOK_TABLE_SIZE = sizeof(chromebookTable) / sizeof(chromebookTable[0]);
+
+// Returns the CB number for the given barcode string, or -1 if not found.
+int lookupCBNumber(const char* barcode) {
+  for (int i = 0; i < CHROMEBOOK_TABLE_SIZE; i++) {
+    if (strcmp(chromebookTable[i].barcode, barcode) == 0) {
+      return chromebookTable[i].cbNumber;
+    }
+  }
+  return -1;
+}
+
+// =============================================================================
 // Barcode Validation
 // =============================================================================
 
 // Called from loop() once barcodeReady is set by BarcodeParser.
-// Compares the scanned barcode string to currentCN (the CB number that was
-// just signed out). A match advances to S_SIGN_OUT_SUCCESS; a mismatch
-// triggers S_BARCODE_ALARM.
-//
-// ASSUMPTION: barcodes on each Chromebook encode the CB number as a plain
-// digit string (e.g., CB 7 has a barcode that scans as "7"). If your barcodes
-// use a longer asset tag format, update this function to match accordingly.
+// Looks up the scanned barcode in chromebookTable to resolve it to a CB number,
+// then checks that it matches the CB number the student entered (currentCN).
+// Unknown barcodes and mismatches both trigger S_BARCODE_ALARM.
 void validateBarcode() {
   Serial.print(F("Barcode scanned: "));
   Serial.println(barcodeBuffer);
 
-  if (strcmp(barcodeBuffer, currentCN) == 0) {
+  int scannedCN = lookupCBNumber(barcodeBuffer);
+
+  if (scannedCN == -1) {
+    Serial.println(F("Barcode not recognized."));
+    enterState(S_BARCODE_ALARM);
+    return;
+  }
+
+  if (scannedCN == atoi(currentCN)) {
     Serial.println(F("Barcode match: correct CB confirmed."));
     enterState(S_SIGN_OUT_SUCCESS);
   } else {
     Serial.print(F("Barcode mismatch. Expected CB "));
     Serial.print(currentCN);
-    Serial.print(F(", got: "));
-    Serial.println(barcodeBuffer);
+    Serial.print(F(", scanned CB "));
+    Serial.println(scannedCN);
     enterState(S_BARCODE_ALARM);
   }
 }
