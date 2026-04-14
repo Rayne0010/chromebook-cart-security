@@ -198,7 +198,7 @@ int lookupCBNumber(const char* barcode) {
 // =============================================================================
 
 // Prefixed with S_ to avoid collision with the Keypad library's KeyState enum.
-enum State {
+enum CartState {
   S_IDLE,                    // waiting for first keypress or * for admin
   S_ENTERING_STUDENT_NUMBER, // student typing their 9-digit number
   S_WAITING_FOR_BARCODE_OUT, // student scanning Chromebook barcode to sign out
@@ -214,7 +214,7 @@ enum State {
   S_BULK_IN_COMPLETE         // admin flow: bulk sign-in done, shown for 3s
 };
 
-State currentState = S_IDLE;
+CartState currentState = S_IDLE;
 
 // =============================================================================
 // Data
@@ -685,7 +685,7 @@ void showError(const char* msg) {
 // State Transition
 // =============================================================================
 
-void enterState(State newState) {
+void enterState(CartState newState) {
   currentState   = newState;
   stateEnteredAt = millis();
   inputBuffer[0] = '\0';
