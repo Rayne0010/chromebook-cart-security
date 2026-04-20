@@ -167,6 +167,7 @@ const int CN_LENGTH             = 2;  // Chromebook numbers 1-30 (1 or 2 digits)
 // Timeout durations (milliseconds)
 const unsigned long FINGERPRINT_TIMEOUT_MS      = 10000;  // 10s to scan finger
 const unsigned long INPUT_TIMEOUT_MS            = 30000;  // 30s idle on any input state
+const unsigned long ADMIN_MENU_TIMEOUT_MS       = 20000;  // 20s idle on admin menu
 const unsigned long MESSAGE_DISPLAY_DURATION_MS = 3000;   // 3s for success/error messages
 
 // Fixed-size char arrays replace String objects to avoid heap fragmentation.
@@ -362,7 +363,7 @@ void loop() {
 
     case S_ADMIN_MENU:
       // Auto-cancel if no key pressed within the timeout window.
-      if (millis() - stateEnteredAt >= INPUT_TIMEOUT_MS) {
+      if (millis() - stateEnteredAt >= ADMIN_MENU_TIMEOUT_MS) {
         enterState(S_IDLE);
         break;
       }
