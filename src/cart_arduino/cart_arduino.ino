@@ -363,6 +363,16 @@ void loop() {
     case S_ADMIN_MENU:
       // 1 = toggle cart mode, 2 = bulk sign-in, 3 = bulk sign-out, * = back to idle
       if (key == '1') {
+        // Block mode toggle if any CBs are still checked out to prevent
+        // orphaned records that can never be cleared in the new mode.
+        int outstanding = 0;
+        for (int i = 0; i < MAX_CHROMEBOOKS; i++) {
+          if (checkoutRecords[i] != 0) outstanding++;
+        }
+        if (outstanding > 0) {
+          showError("CBs still out");
+          break;
+        }
         cartMode = 1 - cartMode;  // toggle between 0 and 1
         saveCartMode();
         Serial.print(F("Cart mode set to: "));
