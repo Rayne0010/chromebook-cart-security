@@ -361,6 +361,11 @@ void loop() {
       break;
 
     case S_ADMIN_MENU:
+      // Auto-cancel if no key pressed within the timeout window.
+      if (millis() - stateEnteredAt >= INPUT_TIMEOUT_MS) {
+        enterState(S_IDLE);
+        break;
+      }
       // 1 = toggle cart mode, 2 = bulk sign-in, 3 = bulk sign-out, * = back to idle
       if (key == '1') {
         // Block mode toggle if any CBs are still checked out to prevent
