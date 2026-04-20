@@ -294,6 +294,11 @@ void setup() {
     Serial.println(F("Fingerprint sensor not found - admin mode unavailable."));
   }
 
+  // Re-initialize LCD after fingerprint sensor init. finger.verifyPassword()
+  // runs SoftwareSerial at 57600 baud, which disables interrupts long enough
+  // to corrupt the I2C state. Calling lcd.begin() again recovers it cleanly.
+  lcd.begin(16, 2);
+
   enterState(S_IDLE);
   Serial.println(F("Cart system ready."));
 }
