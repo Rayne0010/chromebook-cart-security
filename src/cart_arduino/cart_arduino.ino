@@ -72,6 +72,22 @@
  *     same admin number to cover multiple enrollment angles. If the matched
  *     fingerID is not in the table, access is denied. S_ENTERING_ADMIN_NUMBER
  *     and handleAdminNumberInput() have been removed.
+ *   - S_BULK_COMPLETE LCD line 2 changed from "X CBs signed out" (17 chars
+ *     with a 2-digit count, clipped the trailing 't' on a 16-char display)
+ *     to "X CBs out" (10 chars max).
+ *   - processBulkSignOut() now shows a "No free CBs" error if every slot is
+ *     already taken, mirroring processBulkSignIn()'s zero-count guard
+ *     instead of silently displaying "0 CBs out".
+ *   - Admin menu timeout timer now resets when the admin presses 1 to toggle
+ *     cart mode. Without this, the existing stateEnteredAt was untouched on
+ *     toggle, so an admin lingering near the timeout could be kicked to
+ *     idle immediately after toggling.
+ *   - S_IDLE digit input is now ignored on bulk-mode carts. Previously a
+ *     student could type all 9 digits before checkOpenRecord() told them
+ *     the cart was bulk-only; the keypad now gates input at idle so only
+ *     * (admin fingerprint) is accepted in bulk mode.
+ *   - Bulk-mode S_IDLE line 2 changed from the awkward truncation
+ *     "Admin accs only" to "Admin only".
  *
  * Team: Julian D., Ethan A., Lennon F. - TEJ4M
  */
@@ -312,7 +328,11 @@ void loop() {
     case S_IDLE:
       // Any digit starts student number entry. * triggers admin fingerprint flow.
       // # is ignored in idle (no context to submit).
+      // On bulk-mode carts, digit presses are ignored entirely so students
+      // don't waste time typing all 9 digits before being told the cart is
+      // bulk-only. Only * (admin access) is accepted.
       if (key && key != '*' && key != '#') {
+        if (cartMode == 1) break;  // bulk cart -- ignore student input at the keypad
         enterState(S_ENTERING_STUDENT_NUMBER);
         // Capture the first digit AFTER enterState() clears inputBuffer,
         // otherwise enterState() would wipe it immediately.
@@ -383,7 +403,10 @@ void loop() {
         saveCartMode();
         Serial.print(F("Cart mode set to: "));
         Serial.println(cartMode == 1 ? F("BULK") : F("INDIVIDUAL"));
-        updateLCD();  // re-render menu to show new mode; don't reset state timer
+        // Reset the admin menu timeout: pressing 1 is active engagement,
+        // so the admin shouldn't be kicked to idle immediately after toggling.
+        stateEnteredAt = millis();
+        updateLCD();  // re-render menu to show new mode
       } else if (key == '2') {
         enterState(S_BULK_IN_CONFIRM);
       } else if (key == '3') {
@@ -660,6 +683,13 @@ void processBulkSignOut() {
     }
   }
 
+  if (count == 0) {
+    // Every slot was already taken (e.g. another admin already bulk-signed-out).
+    // Mirror processBulkSignIn's behaviour rather than showing a misleading "0 CBs".
+    showError("No free CBs");
+    return;
+  }
+
   lastBulkCount = count;
   Serial.print(F("Bulk sign-out by admin "));
   Serial.print(adminNum);
@@ -754,7 +784,10 @@ void updateLCD() {
       if (cartMode == 1) {
         lcd.print(F("Bulk cart"));
         lcd.setCursor(0, 1);
-        lcd.print(F("Admin accs only"));
+        // "Admin only" reads cleaner than the previous "Admin accs only"
+        // (an awkward truncation of "access"). Bulk-mode users press *
+        // for fingerprint access; no other prompt is needed.
+        lcd.print(F("Admin only"));
       } else {
         lcd.print(F("Enter student #"));
       }
@@ -847,7 +880,10 @@ void updateLCD() {
       lcd.print(F("Bulk OUT done!"));
       lcd.setCursor(0, 1);
       lcd.print(lastBulkCount);
-      lcd.print(F(" CBs signed out"));
+      // "X CBs out" stays under 16 chars even with a 2-digit count (max 10
+      // chars). The previous "X CBs signed out" was 17 with 2 digits and
+      // clipped the trailing 't' on a 16-char display.
+      lcd.print(F(" CBs out"));
       break;
 
     case S_BULK_IN_CONFIRM:
