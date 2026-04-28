@@ -16,9 +16,14 @@
  *
  * States (Secondary Scope - Admin):
  *   S_IDLE -(*)--> S_WAITING_FOR_FINGERPRINT
- *   -> S_ENTERING_ADMIN_NUMBER -> S_ADMIN_MENU
+ *   -> S_ADMIN_MENU
  *   -> S_BULK_CONFIRM -> S_BULK_COMPLETE
  *   -> S_BULK_IN_CONFIRM -> S_BULK_IN_COMPLETE
+ *
+ * States (Secondary Scope - Barcode):
+ *   S_SIGN_OUT_SUCCESS -(3s)--> S_SCAN_TIMER_ACTIVE
+ *   -- correct CB scanned --> S_IDLE
+ *   -- wrong/unknown/timeout --> S_BARCODE_ALARM -(*)--> S_WAITING_FOR_FINGERPRINT
  *
  * Fix notes:
  *   - Removed recursive enterState() calls from inside updateLCD().
@@ -88,6 +93,32 @@
  *     * (admin fingerprint) is accepted in bulk mode.
  *   - Bulk-mode S_IDLE line 2 changed from the awkward truncation
  *     "Admin accs only" to "Admin only".
+ *   - WAVE-14810 Waveshare 1D/2D barcode scanner integrated on
+ *     SoftwareSerial pins 11 (RX) / 12 (TX) at 9600 baud. Two new states
+ *     added: S_SCAN_TIMER_ACTIVE follows S_SIGN_OUT_SUCCESS and gives the
+ *     student SCAN_TIMER_MS (30s) to scan the CB they just signed out.
+ *     S_BARCODE_ALARM is entered on wrong/unknown barcode or scan timeout
+ *     and is cleared by admin fingerprint via the existing flow.
+ *     A 30-slot cbTable[] in PROGMEM maps barcode strings to CB numbers;
+ *     placeholders to be replaced with real asset-tag barcodes during
+ *     deployment. SoftwareSerial .listen() is now called explicitly in
+ *     enterState() to switch the active receiver between fingerprintSerial
+ *     and barcodeSerial -- only one SoftwareSerial can RX at a time on AVR.
+ *     Sign-IN does not require barcode verification (per UML); only sign-OUT
+ *     triggers the scan timer. Bulk operations bypass barcode verification
+ *     entirely. expectedCN is set in confirmSignOut() so the scan timer
+ *     state knows which CB to validate against.
+ *     One-time hardware setup required before deployment: scan the "switch
+ *     to UART output mode" config code from the WAVE-14810 user manual to
+ *     change the scanner from its default HID-keyboard mode to UART output.
+ *   - Sticky alarm flag (alarmActive) added to prevent the barcode alarm
+ *     from being cleared by a non-admin triggering a fingerprint timeout.
+ *     Without this, a student could press * at the alarm screen, wait for
+ *     fingerprint timeout, and let S_ERROR_DISPLAY -> S_IDLE silently clear
+ *     the alarm. enterState() now intercepts S_IDLE transitions while
+ *     alarmActive is true and redirects back to S_BARCODE_ALARM. The flag
+ *     is set on entry to S_BARCODE_ALARM and only cleared after a
+ *     successful admin fingerprint match in handleFingerprintInput().
  *
  * Team: Julian D., Ethan A., Lennon F. - TEJ4M
  */
@@ -127,6 +158,33 @@ rgb_lcd lcd;
 SoftwareSerial fingerprintSerial(A0, A1);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerprintSerial);
 
+// -- Barcode Scanner --
+// Waveshare WAVE-14810 1D/2D barcode scanner on SoftwareSerial: RX = pin 11
+// (connect to scanner's TX), TX = pin 12 (connect to scanner's RX).
+// UART defaults: 9600 baud, 8N1, terminator = CR.
+//
+// IMPORTANT one-time setup before deployment: the scanner ships configured
+// for HID-keyboard output. It must be switched to UART output mode by
+// scanning the "Setting code to enable UART" barcode from the user manual
+// (Waveshare wiki: waveshare.com/wiki/Barcode_Scanner_Module). The setting
+// is saved to the scanner's onboard EEPROM and persists across power cycles.
+//
+// SoftwareSerial constraint: only one instance can receive at a time on AVR.
+// enterState() calls .listen() on whichever instance the new state needs,
+// so the fingerprint sensor and barcode scanner never compete for RX.
+//
+// Power: scanner draws ~135 mA when actively scanning. Within the Uno's
+// 5V regulator budget when running on a 9V external supply, but consider a
+// dedicated 5V supply for production builds with multiple peripherals.
+SoftwareSerial barcodeSerial(11, 12);
+
+// Trigger command from the WAVE-14810 manual: tells the scanner to start a
+// single scan attempt with its internal timeout. Sent on entry to
+// S_SCAN_TIMER_ACTIVE and re-sent every SCAN_RETRIGGER_MS so the scanner
+// stays armed even if a barcode briefly leaves the field of view.
+const uint8_t SCAN_TRIGGER_CMD[] = { 0x16, 0x54, 0x0D };
+const unsigned long SCAN_RETRIGGER_MS = 3000;
+
 // =============================================================================
 // State Machine
 // =============================================================================
@@ -138,7 +196,7 @@ enum State {
   S_ENTERING_STUDENT_NUMBER, // student typing their 9-digit number
   S_ENTERING_CN_OUT,         // student typing Chromebook number to sign out
   S_ENTERING_CN_IN,          // student typing Chromebook number to sign in
-  S_SIGN_OUT_SUCCESS,        // confirmation message shown for 3s then -> IDLE
+  S_SIGN_OUT_SUCCESS,        // confirmation message shown for 3s then -> SCAN_TIMER
   S_SIGN_IN_SUCCESS,         // confirmation message shown for 3s then -> IDLE
   S_ERROR_DISPLAY,           // error message shown for 3s then -> IDLE
   S_WAITING_FOR_FINGERPRINT, // admin flow: waiting for finger on sensor
@@ -146,7 +204,9 @@ enum State {
   S_BULK_CONFIRM,            // admin flow: confirm sign-out of entire cart
   S_BULK_COMPLETE,           // admin flow: bulk sign-out done, shown for 3s
   S_BULK_IN_CONFIRM,         // admin flow: confirm sign-in of entire cart
-  S_BULK_IN_COMPLETE         // admin flow: bulk sign-in done, shown for 3s
+  S_BULK_IN_COMPLETE,        // admin flow: bulk sign-in done, shown for 3s
+  S_SCAN_TIMER_ACTIVE,       // post-sign-out: waiting for student to scan their CB
+  S_BARCODE_ALARM            // wrong/unknown/missed scan; awaiting admin reset
 };
 
 State currentState = S_IDLE;
@@ -185,6 +245,7 @@ const unsigned long FINGERPRINT_TIMEOUT_MS      = 10000;  // 10s to scan finger
 const unsigned long INPUT_TIMEOUT_MS            = 30000;  // 30s idle on any input state
 const unsigned long ADMIN_MENU_TIMEOUT_MS       = 20000;  // 20s idle on admin menu
 const unsigned long MESSAGE_DISPLAY_DURATION_MS = 3000;   // 3s for success/error messages
+const unsigned long SCAN_TIMER_MS               = 30000;  // 30s window to scan after sign-out
 
 // Fixed-size char arrays replace String objects to avoid heap fragmentation.
 // Sizes include the null terminator.
@@ -193,6 +254,29 @@ char currentStudentNumber[10] = "";  // student number confirmed this session
 char currentAdminNumber[10]   = "";  // admin number confirmed after fingerprint
 char currentCN[3]             = "";  // Chromebook number confirmed this session (max 2 digits + \0)
 char errorMessage[17]         = "";  // error text for LCD line 2 (max 16 chars + \0)
+
+// Barcode scanner receive buffer. Bytes accumulate here as the scanner streams
+// the barcode over UART; the buffer is flushed on each terminator (CR/LF) and
+// at every transition into S_SCAN_TIMER_ACTIVE.
+const byte BARCODE_BUFFER_SIZE = 24;
+char barcodeBuffer[BARCODE_BUFFER_SIZE] = "";
+byte barcodePos = 0;
+
+// CB number the student just signed out. Set in confirmSignOut(); checked
+// against the looked-up CB number of the scanned barcode in S_SCAN_TIMER_ACTIVE.
+int expectedCN = 0;
+
+// Last time SCAN_TRIGGER_CMD was sent to the scanner; used to retrigger
+// every SCAN_RETRIGGER_MS during S_SCAN_TIMER_ACTIVE.
+unsigned long lastTriggerAt = 0;
+
+// Sticky alarm flag. Set true when entering S_BARCODE_ALARM, cleared only
+// when an admin successfully authenticates via fingerprint. While true,
+// every transition into S_IDLE is intercepted in enterState() and redirected
+// back to S_BARCODE_ALARM, so a non-admin cannot clear the alarm by simply
+// triggering a fingerprint timeout (which would otherwise route through
+// S_ERROR_DISPLAY -> S_IDLE).
+bool alarmActive = false;
 
 // Timestamp of when the current state was entered, used for timeouts
 unsigned long stateEnteredAt = 0;
@@ -290,6 +374,81 @@ long lookupAdminNumber(uint8_t fpID) {
 }
 
 // =============================================================================
+// Chromebook Barcode Lookup Table
+// =============================================================================
+
+// Maps each Chromebook's asset-tag barcode (as read by the WAVE-14810 scanner)
+// to its slot number in the cart (1 - MAX_CHROMEBOOKS). Stored in PROGMEM
+// because 30 entries x 17 bytes = 510 bytes, which would consume 25% of the
+// Uno's 2 KB SRAM if kept in RAM.
+//
+// HOW TO POPULATE:
+//   1. Connect the scanner to a computer in keyboard mode (default factory
+//      setting) and scan each Chromebook's asset-tag barcode into a text
+//      editor to capture the exact string.
+//   2. Replace the corresponding placeholder below with the captured string.
+//   3. Re-upload this sketch. The cart will recognize that barcode as the
+//      mapped CB number from then on.
+//
+// The barcode field is 16 chars max (15 + null terminator). If a Chromebook's
+// barcode is longer than 15 chars, increase the array size in CBEntry, the
+// BARCODE_BUFFER_SIZE constant, and the placeholder lengths together.
+struct CBEntry {
+  char    barcode[16];  // up to 15 chars + \0
+  uint8_t cbNumber;     // 1 - MAX_CHROMEBOOKS
+};
+
+const CBEntry cbTable[] PROGMEM = {
+  // -- Replace placeholders with real asset-tag barcodes as they're captured --
+  { "CB001-PLACEHLD",  1 },
+  { "CB002-PLACEHLD",  2 },
+  { "CB003-PLACEHLD",  3 },
+  { "CB004-PLACEHLD",  4 },
+  { "CB005-PLACEHLD",  5 },
+  { "CB006-PLACEHLD",  6 },
+  { "CB007-PLACEHLD",  7 },
+  { "CB008-PLACEHLD",  8 },
+  { "CB009-PLACEHLD",  9 },
+  { "CB010-PLACEHLD", 10 },
+  { "CB011-PLACEHLD", 11 },
+  { "CB012-PLACEHLD", 12 },
+  { "CB013-PLACEHLD", 13 },
+  { "CB014-PLACEHLD", 14 },
+  { "CB015-PLACEHLD", 15 },
+  { "CB016-PLACEHLD", 16 },
+  { "CB017-PLACEHLD", 17 },
+  { "CB018-PLACEHLD", 18 },
+  { "CB019-PLACEHLD", 19 },
+  { "CB020-PLACEHLD", 20 },
+  { "CB021-PLACEHLD", 21 },
+  { "CB022-PLACEHLD", 22 },
+  { "CB023-PLACEHLD", 23 },
+  { "CB024-PLACEHLD", 24 },
+  { "CB025-PLACEHLD", 25 },
+  { "CB026-PLACEHLD", 26 },
+  { "CB027-PLACEHLD", 27 },
+  { "CB028-PLACEHLD", 28 },
+  { "CB029-PLACEHLD", 29 },
+  { "CB030-PLACEHLD", 30 },
+};
+const int CB_TABLE_SIZE = sizeof(cbTable) / sizeof(cbTable[0]);
+
+// Returns the CB number for the given barcode, or 0 if not in the table.
+// Reads each entry out of PROGMEM into a small stack-allocated CBEntry to
+// perform the comparison; this keeps RAM usage to one CBEntry's worth (~17 B)
+// regardless of CB_TABLE_SIZE.
+int lookupCBNumber(const char* barcode) {
+  CBEntry entry;
+  for (int i = 0; i < CB_TABLE_SIZE; i++) {
+    memcpy_P(&entry, &cbTable[i], sizeof(CBEntry));
+    if (strcmp(barcode, entry.barcode) == 0) {
+      return entry.cbNumber;
+    }
+  }
+  return 0;
+}
+
+// =============================================================================
 // Setup
 // =============================================================================
 
@@ -310,6 +469,12 @@ void setup() {
     // System still works for student flow; admin mode will be unavailable.
     Serial.println(F("Fingerprint sensor not found - admin mode unavailable."));
   }
+
+  // Barcode scanner: 9600 baud per WAVE-14810 default UART setting.
+  // begin() leaves this instance in the listening state; enterState() will
+  // switch to fingerprintSerial.listen() when the admin flow needs it, then
+  // switch back here on entry to S_SCAN_TIMER_ACTIVE.
+  barcodeSerial.begin(9600);
 
   enterState(S_IDLE);
   Serial.println(F("Cart system ready."));
@@ -363,12 +528,22 @@ void loop() {
       handleCNInput(key);
       break;
 
-    // These states just display a message and auto-return to idle after a delay.
+    // S_ERROR_DISPLAY and S_SIGN_IN_SUCCESS just display a message and return
+    // to idle. S_SIGN_OUT_SUCCESS is special: it transitions into the barcode
+    // scan timer so the student must verify the CB they just signed out.
     case S_ERROR_DISPLAY:
-    case S_SIGN_OUT_SUCCESS:
     case S_SIGN_IN_SUCCESS:
       if (millis() - stateEnteredAt >= MESSAGE_DISPLAY_DURATION_MS) {
         enterState(S_IDLE);
+      }
+      break;
+
+    case S_SIGN_OUT_SUCCESS:
+      if (millis() - stateEnteredAt >= MESSAGE_DISPLAY_DURATION_MS) {
+        // After the success confirmation, require the student to scan the
+        // physical barcode on the CB they just signed out. expectedCN was
+        // set in confirmSignOut() so S_SCAN_TIMER_ACTIVE knows what to match.
+        enterState(S_SCAN_TIMER_ACTIVE);
       }
       break;
 
@@ -443,6 +618,34 @@ void loop() {
     case S_BULK_IN_COMPLETE:
       if (millis() - stateEnteredAt >= MESSAGE_DISPLAY_DURATION_MS) {
         enterState(S_IDLE);
+      }
+      break;
+
+    case S_SCAN_TIMER_ACTIVE:
+      // Re-arm the scanner periodically so it stays ready to read even if
+      // the student's first attempt missed (CB was outside the field of view,
+      // angle was bad, etc.). Sending a trigger while the scanner is already
+      // mid-scan is harmless; it just resets the scanner's internal timeout.
+      if (millis() - lastTriggerAt >= SCAN_RETRIGGER_MS) {
+        barcodeSerial.write(SCAN_TRIGGER_CMD, sizeof(SCAN_TRIGGER_CMD));
+        lastTriggerAt = millis();
+      }
+      pollBarcodeScanner();
+
+      // Overall window expired without a valid scan -> trigger the alarm.
+      if (millis() - stateEnteredAt >= SCAN_TIMER_MS) {
+        Serial.println(F("Scan timeout - alarm"));
+        enterState(S_BARCODE_ALARM);
+      }
+      break;
+
+    case S_BARCODE_ALARM:
+      // Admin can clear the alarm via fingerprint. * starts the existing
+      // fingerprint flow which on success lands in S_ADMIN_MENU; the admin
+      // can then exit normally with * to return to S_IDLE. No keypad input
+      // from students will dismiss the alarm.
+      if (key == '*') {
+        enterState(S_WAITING_FOR_FINGERPRINT);
       }
       break;
 
@@ -565,10 +768,83 @@ void handleFingerprintInput() {
     Serial.print(finger.fingerID);
     Serial.print(F(" -> Admin: "));
     Serial.println(currentAdminNumber);
+    // Successful admin authentication clears any active barcode alarm so
+    // S_IDLE is no longer redirected back to S_BARCODE_ALARM. If the admin
+    // entered the fingerprint flow for a different reason (e.g. bulk ops),
+    // clearing a non-set flag is a no-op.
+    alarmActive = false;
     enterState(S_ADMIN_MENU);
   } else {
     showError("Access denied");
   }
+}
+
+// Drains the SoftwareSerial RX buffer for the WAVE-14810 scanner. Bytes are
+// accumulated into barcodeBuffer until a CR or LF terminator is seen, at
+// which point processBarcode() is called with the complete null-terminated
+// barcode string. Non-printable bytes are filtered out so the occasional
+// stray byte (e.g. from a trigger-command echo) doesn't corrupt the buffer.
+void pollBarcodeScanner() {
+  while (barcodeSerial.available()) {
+    char c = barcodeSerial.read();
+
+    if (c == '\r' || c == '\n') {
+      // End-of-barcode terminator. processBarcode() will reset us to a new
+      // state, so the buffer reset here only matters if barcodePos was 0
+      // (an empty terminator caused by CRLF or stray newline -- ignore it).
+      if (barcodePos > 0) {
+        barcodeBuffer[barcodePos] = '\0';
+        processBarcode();
+        barcodePos = 0;
+      }
+    } else if (c >= ' ' && c <= '~') {
+      // Printable ASCII: append if there's room. Anything else is dropped.
+      if (barcodePos < BARCODE_BUFFER_SIZE - 1) {
+        barcodeBuffer[barcodePos++] = c;
+      } else {
+        // Buffer overflow: barcode is longer than BARCODE_BUFFER_SIZE - 1.
+        // Reset and ignore this scan; expanding the buffer will allow
+        // longer barcodes through.
+        barcodePos = 0;
+      }
+    }
+  }
+}
+
+// Looks up the scanned barcode in cbTable and either confirms the sign-out
+// (returning to S_IDLE) or trips the alarm (S_BARCODE_ALARM) on a mismatch.
+// Called from pollBarcodeScanner() once a complete barcode has been received.
+void processBarcode() {
+  Serial.print(F("Scanned: "));
+  Serial.println(barcodeBuffer);
+
+  int scannedCN = lookupCBNumber(barcodeBuffer);
+
+  if (scannedCN == 0) {
+    // Barcode is not in cbTable -- either not a CB at all (random object)
+    // or a CB whose barcode hasn't been registered in the lookup table yet.
+    Serial.println(F("Unknown barcode - alarm"));
+    enterState(S_BARCODE_ALARM);
+    return;
+  }
+
+  if (scannedCN != expectedCN) {
+    // Barcode is a known CB, but not the one this student signed out for.
+    // This catches a student grabbing the wrong CB (or grabbing two).
+    Serial.print(F("Wrong CB: scanned "));
+    Serial.print(scannedCN);
+    Serial.print(F(", expected "));
+    Serial.print(expectedCN);
+    Serial.println(F(" - alarm"));
+    enterState(S_BARCODE_ALARM);
+    return;
+  }
+
+  // Match: scanned CB equals the one signed out. Verification complete.
+  Serial.print(F("CB "));
+  Serial.print(scannedCN);
+  Serial.println(F(" verified."));
+  enterState(S_IDLE);
 }
 
 // =============================================================================
@@ -631,6 +907,11 @@ void confirmSignOut() {
   Serial.print(studentNum);
   Serial.print(F(" -> CB "));
   Serial.println(cn);
+
+  // Remember which CB was just signed out so S_SCAN_TIMER_ACTIVE can verify
+  // the scanned barcode matches. The success message displays for 3s first,
+  // then the loop transitions S_SIGN_OUT_SUCCESS -> S_SCAN_TIMER_ACTIVE.
+  expectedCN = cn;
 
   enterState(S_SIGN_OUT_SUCCESS);
 }
@@ -752,15 +1033,38 @@ void showError(const char* msg) {
 // currentState directly so that the timestamp, inputBuffer, serial flush,
 // and LCD update all happen consistently on every transition.
 void enterState(State newState) {
+  // Sticky alarm interception: while alarmActive is set, any attempt to
+  // transition into S_IDLE is redirected back to S_BARCODE_ALARM. This keeps
+  // the alarm visible and uncleared until an admin successfully authenticates
+  // (which clears alarmActive in handleFingerprintInput).
+  if (newState == S_IDLE && alarmActive) {
+    newState = S_BARCODE_ALARM;
+  }
+  // Mark the alarm sticky from the moment it activates, regardless of how
+  // we got here (timeout, wrong CB, unknown barcode).
+  if (newState == S_BARCODE_ALARM) {
+    alarmActive = true;
+  }
+
   currentState   = newState;
   stateEnteredAt = millis();
   inputBuffer[0] = '\0';
 
-  // Flush any stale bytes that accumulated in the SoftwareSerial RX buffer
-  // while the sensor was idle. Without this, fingerSearch() may misread a
-  // leftover frame from a prior scan and immediately deny access.
+  // SoftwareSerial constraint: only one instance can receive at a time on
+  // AVR. Switch the active listener to whichever sensor the new state needs,
+  // and flush its RX buffer so stale bytes from a prior session don't get
+  // mistaken for fresh data.
   if (newState == S_WAITING_FOR_FINGERPRINT) {
+    fingerprintSerial.listen();
     while (fingerprintSerial.available()) fingerprintSerial.read();
+  } else if (newState == S_SCAN_TIMER_ACTIVE) {
+    barcodeSerial.listen();
+    while (barcodeSerial.available()) barcodeSerial.read();
+    barcodePos = 0;
+    // Trigger immediately on entry so the scanner is armed before the loop
+    // ticks; the periodic retrigger in loop() handles re-arming after that.
+    barcodeSerial.write(SCAN_TRIGGER_CMD, sizeof(SCAN_TRIGGER_CMD));
+    lastTriggerAt = millis();
   }
 
   updateLCD();
@@ -901,6 +1205,25 @@ void updateLCD() {
       lcd.setCursor(0, 1);
       lcd.print(lastBulkCount);
       lcd.print(F(" CBs returned"));
+      break;
+
+    case S_SCAN_TIMER_ACTIVE:
+      lcd.setRGB(255, 165, 0);  // orange (matches sign-out color family)
+      lcd.setCursor(0, 0);
+      lcd.print(F("Scan CB #"));
+      lcd.print(expectedCN);
+      lcd.setCursor(0, 1);
+      lcd.print(F("Show barcode..."));
+      break;
+
+    case S_BARCODE_ALARM:
+      lcd.setRGB(255, 0, 0);  // red
+      lcd.setCursor(0, 0);
+      lcd.print(F("!! ALARM !!"));
+      lcd.setCursor(0, 1);
+      // Tells the admin how to clear the alarm. * starts the existing
+      // fingerprint flow which on success transitions to S_ADMIN_MENU.
+      lcd.print(F("*:Admin reset"));
       break;
 
     default:
