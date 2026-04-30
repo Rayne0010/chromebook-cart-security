@@ -119,6 +119,14 @@
  *     alarmActive is true and redirects back to S_BARCODE_ALARM. The flag
  *     is set on entry to S_BARCODE_ALARM and only cleared after a
  *     successful admin fingerprint match in handleFingerprintInput().
+ *   - alarmActive is now persisted to EEPROM at byte 125 so the alarm
+ *     survives power loss. Without this, an attacker could trip the alarm,
+ *     unplug the cart, plug it back in, and land on a clean idle screen.
+ *     The EEPROM write is gated on the actual flag transition (false -> true
+ *     and true -> false) rather than firing on every entry to S_BARCODE_ALARM,
+ *     since the sticky redirect re-enters that state on every loop iteration
+ *     while the alarm is active and an unconditional write would exhaust the
+ *     EEPROM byte's ~100k write endurance.
  *
  * Team: Julian D., Ethan A., Lennon F. - TEJ4M
  */
@@ -226,10 +234,12 @@ long checkoutRecords[MAX_CHROMEBOOKS];
 //   Bytes 120-123: magic number (used to detect whether EEPROM has been
 //                  initialized; avoids treating garbage as valid records)
 //   Byte    124:   cartMode (0 = individual, 1 = bulk)
+//   Byte    125:   alarmActive (0 = clear, 1 = active)
 const int EEPROM_BASE_ADDR      = 0;
 const int EEPROM_MAGIC_ADDR     = MAX_CHROMEBOOKS * sizeof(long);  // = 120
 const long EEPROM_MAGIC         = 12345678L;
 const int EEPROM_CART_MODE_ADDR = EEPROM_MAGIC_ADDR + sizeof(long);  // = 124
+const int EEPROM_ALARM_ADDR     = EEPROM_CART_MODE_ADDR + 1;         // = 125
 
 // Cart operating mode, persisted to EEPROM.
 // 0 = INDIVIDUAL: students sign CBs in/out one at a time; bulk ops blocked.
@@ -276,6 +286,10 @@ unsigned long lastTriggerAt = 0;
 // back to S_BARCODE_ALARM, so a non-admin cannot clear the alarm by simply
 // triggering a fingerprint timeout (which would otherwise route through
 // S_ERROR_DISPLAY -> S_IDLE).
+//
+// Persisted to EEPROM so the alarm survives power loss. Without this, an
+// attacker could trip the alarm, unplug the cart, plug it back in, and land
+// on a clean idle screen.
 bool alarmActive = false;
 
 // Timestamp of when the current state was entered, used for timeouts
@@ -300,10 +314,18 @@ void saveCartMode() {
   EEPROM.put(EEPROM_CART_MODE_ADDR, cartMode);
 }
 
-// Load all checkout records and cartMode from EEPROM on boot.
+// Write the current alarmActive flag to EEPROM.
+// Called whenever the alarm state changes (set on alarm trigger, cleared on
+// successful admin auth) so the alarm survives a power cycle.
+void saveAlarmState() {
+  byte v = alarmActive ? 1 : 0;
+  EEPROM.put(EEPROM_ALARM_ADDR, v);
+}
+
+// Load all checkout records, cartMode, and alarmActive from EEPROM on boot.
 // If the magic number is missing (first power-on or after a flash), all records
-// are initialized to 0, cartMode is set to INDIVIDUAL (0), and the magic number
-// is written so subsequent boots load real data.
+// are initialized to 0, cartMode is set to INDIVIDUAL (0), alarmActive is set
+// to 0, and the magic number is written so subsequent boots load real data.
 void loadRecords() {
   long magic;
   EEPROM.get(EEPROM_MAGIC_ADDR, magic);
@@ -315,17 +337,29 @@ void loadRecords() {
     }
     cartMode = 0;
     EEPROM.put(EEPROM_CART_MODE_ADDR, cartMode);
+    alarmActive = false;
+    byte alarmByte = 0;
+    EEPROM.put(EEPROM_ALARM_ADDR, alarmByte);
     EEPROM.put(EEPROM_MAGIC_ADDR, EEPROM_MAGIC);
     Serial.println(F("EEPROM initialized."));
   } else {
-    // Normal boot: load previously saved records and mode into RAM.
+    // Normal boot: load previously saved records, mode, and alarm state into RAM.
     for (int i = 0; i < MAX_CHROMEBOOKS; i++) {
       EEPROM.get(EEPROM_BASE_ADDR + i * sizeof(long), checkoutRecords[i]);
     }
     EEPROM.get(EEPROM_CART_MODE_ADDR, cartMode);
     // Guard against corrupted mode byte (anything other than 0 or 1)
     if (cartMode != 0 && cartMode != 1) cartMode = 0;
-    Serial.println(F("Records loaded from EEPROM."));
+    byte alarmByte;
+    EEPROM.get(EEPROM_ALARM_ADDR, alarmByte);
+    // Guard against corrupted alarm byte (anything other than 0 or 1)
+    if (alarmByte != 0 && alarmByte != 1) alarmByte = 0;
+    alarmActive = (alarmByte == 1);
+    if (alarmActive) {
+      Serial.println(F("Records loaded from EEPROM. Alarm was active."));
+    } else {
+      Serial.println(F("Records loaded from EEPROM."));
+    }
   }
 }
 
@@ -771,8 +805,11 @@ void handleFingerprintInput() {
     // Successful admin authentication clears any active barcode alarm so
     // S_IDLE is no longer redirected back to S_BARCODE_ALARM. If the admin
     // entered the fingerprint flow for a different reason (e.g. bulk ops),
-    // clearing a non-set flag is a no-op.
-    alarmActive = false;
+    // clearing a non-set flag is a no-op and we skip the EEPROM write.
+    if (alarmActive) {
+      alarmActive = false;
+      saveAlarmState();
+    }
     enterState(S_ADMIN_MENU);
   } else {
     showError("Access denied");
@@ -1041,9 +1078,13 @@ void enterState(State newState) {
     newState = S_BARCODE_ALARM;
   }
   // Mark the alarm sticky from the moment it activates, regardless of how
-  // we got here (timeout, wrong CB, unknown barcode).
-  if (newState == S_BARCODE_ALARM) {
+  // we got here (timeout, wrong CB, unknown barcode). Persist to EEPROM only
+  // when the flag actually transitions from false to true; the redirect above
+  // routes through here on every re-entry to S_BARCODE_ALARM, so an
+  // unconditional write would burn EEPROM cycles unnecessarily.
+  if (newState == S_BARCODE_ALARM && !alarmActive) {
     alarmActive = true;
+    saveAlarmState();
   }
 
   currentState   = newState;
