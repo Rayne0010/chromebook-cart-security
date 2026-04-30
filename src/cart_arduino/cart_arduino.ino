@@ -94,7 +94,7 @@
  *   - Bulk-mode S_IDLE line 2 changed from the awkward truncation
  *     "Admin accs only" to "Admin only".
  *   - WAVE-14810 Waveshare 1D/2D barcode scanner integrated on
- *     SoftwareSerial pins 11 (RX) / 12 (TX) at 9600 baud. Two new states
+ *     SoftwareSerial pins 9 (RX) / 10 (TX) at 9600 baud. Two new states
  *     added: S_SCAN_TIMER_ACTIVE follows S_SIGN_OUT_SUCCESS and gives the
  *     student SCAN_TIMER_MS (30s) to scan the CB they just signed out.
  *     S_BARCODE_ALARM is entered on wrong/unknown barcode or scan timeout
@@ -159,8 +159,8 @@ SoftwareSerial fingerprintSerial(A0, A1);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerprintSerial);
 
 // -- Barcode Scanner --
-// Waveshare WAVE-14810 1D/2D barcode scanner on SoftwareSerial: RX = pin 11
-// (connect to scanner's TX), TX = pin 12 (connect to scanner's RX).
+// Waveshare WAVE-14810 1D/2D barcode scanner on SoftwareSerial: RX = pin 9
+// (connect to scanner's TX), TX = pin 10 (connect to scanner's RX).
 // UART defaults: 9600 baud, 8N1, terminator = CR.
 //
 // IMPORTANT one-time setup before deployment: the scanner ships configured
@@ -176,7 +176,7 @@ Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerprintSerial);
 // Power: scanner draws ~135 mA when actively scanning. Within the Uno's
 // 5V regulator budget when running on a 9V external supply, but consider a
 // dedicated 5V supply for production builds with multiple peripherals.
-SoftwareSerial barcodeSerial(11, 12);
+SoftwareSerial barcodeSerial(9, 10);
 
 // Trigger command from the WAVE-14810 manual: tells the scanner to start a
 // single scan attempt with its internal timeout. Sent on entry to
