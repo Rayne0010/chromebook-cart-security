@@ -108,9 +108,18 @@
  *     triggers the scan timer. Bulk operations bypass barcode verification
  *     entirely. expectedCN is set in confirmSignOut() so the scan timer
  *     state knows which CB to validate against.
- *     One-time hardware setup required before deployment: scan the "switch
- *     to UART output mode" config code from the WAVE-14810 user manual to
- *     change the scanner from its default HID-keyboard mode to UART output.
+ *   - Switched scanner from manual trigger mode to Sensing Mode (configured
+ *     once at deployment by scanning the "Sensing Mode" config barcode from
+ *     the WAVE-14810 V2.1 manual). The scanner now auto-scans on detected
+ *     ambient motion and de-duplicates the same barcode within ~1s, so the
+ *     student just waves the CB past the lens without pressing the trigger
+ *     button. Removed the SCAN_TRIGGER_CMD constant, SCAN_RETRIGGER_MS, the
+ *     lastTriggerAt timestamp, the periodic retrigger in loop(), and the
+ *     trigger-on-entry write in enterState(). Bytes the scanner emits at
+ *     idle are still discarded safely: fingerprintSerial is the active
+ *     listener during admin flow so barcode bytes are dropped at the
+ *     hardware layer, and S_SCAN_TIMER_ACTIVE always flushes the RX buffer
+ *     on entry.
  *   - Sticky alarm flag (alarmActive) added to prevent the barcode alarm
  *     from being cleared by a non-admin triggering a fingerprint timeout.
  *     Without this, a student could press * at the alarm screen, wait for
@@ -171,27 +180,33 @@ Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerprintSerial);
 // (connect to scanner's TX), TX = pin 10 (connect to scanner's RX).
 // UART defaults: 9600 baud, 8N1, terminator = CR.
 //
-// IMPORTANT one-time setup before deployment: the scanner ships configured
-// for HID-keyboard output. It must be switched to UART output mode by
-// scanning the "Setting code to enable UART" barcode from the user manual
-// (Waveshare wiki: waveshare.com/wiki/Barcode_Scanner_Module). The setting
-// is saved to the scanner's onboard EEPROM and persists across power cycles.
+// IMPORTANT one-time setup before deployment (scan once with the scanner
+// hooked to a USB host that can read its keyboard output, e.g. a laptop):
+//   1. "Setting code to enable UART" -- switches output from HID-keyboard
+//      to UART on hardware revisions that ship in HID mode (V2.1 firmware
+//      ships UART by default; V1.x ships HID).
+//   2. "Sensing Mode" config barcode -- switches the scanner from manual
+//      trigger mode to sensing mode. In sensing mode the scanner uses its
+//      ambient light sensor to detect motion in front of the lens and
+//      auto-scans without any trigger command from the Arduino. After a
+//      successful scan it enters a 1.0s non-scanning interval, then resumes
+//      detecting. The same barcode is also de-duplicated within ~1.0s.
+// Both settings are saved to the scanner's onboard EEPROM and persist
+// across power cycles. Manual section "Sensing Mode" (page 22, V2.1).
 //
 // SoftwareSerial constraint: only one instance can receive at a time on AVR.
 // enterState() calls .listen() on whichever instance the new state needs,
 // so the fingerprint sensor and barcode scanner never compete for RX.
+// Bytes the scanner emits at idle (e.g. a stray CB drifting past the lens)
+// either pile up in the SoftwareSerial RX buffer harmlessly or are dropped
+// outright while fingerprintSerial is the active listener; either way the
+// buffer is flushed on every entry to S_SCAN_TIMER_ACTIVE.
 //
-// Power: scanner draws ~135 mA when actively scanning. Within the Uno's
-// 5V regulator budget when running on a 9V external supply, but consider a
-// dedicated 5V supply for production builds with multiple peripherals.
+// Power: in sensing mode the ambient sensor and aimer are kept active
+// continuously, raising idle current draw above the 25 mA standby figure
+// (closer to 50-80 mA). Still within the Uno's 5V regulator budget on a
+// 9V external supply, but worth a dedicated 5V supply for production.
 SoftwareSerial barcodeSerial(9, 10);
-
-// Trigger command from the WAVE-14810 manual: tells the scanner to start a
-// single scan attempt with its internal timeout. Sent on entry to
-// S_SCAN_TIMER_ACTIVE and re-sent every SCAN_RETRIGGER_MS so the scanner
-// stays armed even if a barcode briefly leaves the field of view.
-const uint8_t SCAN_TRIGGER_CMD[] = { 0x16, 0x54, 0x0D };
-const unsigned long SCAN_RETRIGGER_MS = 3000;
 
 // =============================================================================
 // State Machine
@@ -275,10 +290,6 @@ byte barcodePos = 0;
 // CB number the student just signed out. Set in confirmSignOut(); checked
 // against the looked-up CB number of the scanned barcode in S_SCAN_TIMER_ACTIVE.
 int expectedCN = 0;
-
-// Last time SCAN_TRIGGER_CMD was sent to the scanner; used to retrigger
-// every SCAN_RETRIGGER_MS during S_SCAN_TIMER_ACTIVE.
-unsigned long lastTriggerAt = 0;
 
 // Sticky alarm flag. Set true when entering S_BARCODE_ALARM, cleared only
 // when an admin successfully authenticates via fingerprint. While true,
@@ -656,14 +667,9 @@ void loop() {
       break;
 
     case S_SCAN_TIMER_ACTIVE:
-      // Re-arm the scanner periodically so it stays ready to read even if
-      // the student's first attempt missed (CB was outside the field of view,
-      // angle was bad, etc.). Sending a trigger while the scanner is already
-      // mid-scan is harmless; it just resets the scanner's internal timeout.
-      if (millis() - lastTriggerAt >= SCAN_RETRIGGER_MS) {
-        barcodeSerial.write(SCAN_TRIGGER_CMD, sizeof(SCAN_TRIGGER_CMD));
-        lastTriggerAt = millis();
-      }
+      // In sensing mode the scanner self-triggers on detected motion and
+      // streams any successful read over UART. We just poll the buffer and
+      // wait for the overall window to expire.
       pollBarcodeScanner();
 
       // Overall window expired without a valid scan -> trigger the alarm.
@@ -820,7 +826,8 @@ void handleFingerprintInput() {
 // accumulated into barcodeBuffer until a CR or LF terminator is seen, at
 // which point processBarcode() is called with the complete null-terminated
 // barcode string. Non-printable bytes are filtered out so the occasional
-// stray byte (e.g. from a trigger-command echo) doesn't corrupt the buffer.
+// stray byte (line noise, partial frame caught at listener-switch time) does
+// not corrupt the buffer.
 void pollBarcodeScanner() {
   while (barcodeSerial.available()) {
     char c = barcodeSerial.read();
@@ -1099,13 +1106,12 @@ void enterState(State newState) {
     fingerprintSerial.listen();
     while (fingerprintSerial.available()) fingerprintSerial.read();
   } else if (newState == S_SCAN_TIMER_ACTIVE) {
+    // Scanner is in sensing mode (configured once at deployment), so no
+    // trigger command is needed -- the scanner self-arms on ambient motion.
+    // Just take the listener and flush any bytes that piled up during idle.
     barcodeSerial.listen();
     while (barcodeSerial.available()) barcodeSerial.read();
     barcodePos = 0;
-    // Trigger immediately on entry so the scanner is armed before the loop
-    // ticks; the periodic retrigger in loop() handles re-arming after that.
-    barcodeSerial.write(SCAN_TRIGGER_CMD, sizeof(SCAN_TRIGGER_CMD));
-    lastTriggerAt = millis();
   }
 
   updateLCD();
