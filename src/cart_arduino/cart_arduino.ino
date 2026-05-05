@@ -136,6 +136,24 @@
  *     since the sticky redirect re-enters that state on every loop iteration
  *     while the alarm is active and an unconditional write would exhaust the
  *     EEPROM byte's ~100k write endurance.
+ *   - Cart lock servo (pin 12) and alarm buzzer (pin 11) integrated. Cart
+ *     starts LOCKED unconditionally on every boot. The unlocked states are:
+ *     S_SIGN_OUT_SUCCESS, S_SIGN_IN_SUCCESS, S_SCAN_TIMER_ACTIVE,
+ *     S_ADMIN_MENU, S_BULK_CONFIRM, S_BULK_COMPLETE, S_BULK_IN_CONFIRM,
+ *     S_BULK_IN_COMPLETE. Everything else (idle, input, fingerprint waiting,
+ *     error display, alarm) is locked. enterState() only commands a servo
+ *     move when the lock requirement actually changes, so transitions
+ *     between two same-locked states don't activate the servo. The servo is
+ *     attached only during the 500ms move and detached immediately after,
+ *     so its Timer1 PWM doesn't disrupt SoftwareSerial RX timing on the
+ *     fingerprint sensor or barcode scanner. Tracing every cross-boundary
+ *     transition confirms no servo move happens while either SoftwareSerial
+ *     is mid-poll. Buzzer is active-high (200ms on / 200ms off) and only
+ *     beeps while currentState == S_BARCODE_ALARM; enterState() silences it
+ *     unconditionally on every transition, so leaving the alarm guarantees
+ *     silence regardless of path. Power note: servo must be driven from a
+ *     dedicated 5V supply with shared ground; the Uno's regulator can
+ *     brown out under combined servo + scanner load.
  *
  * Team: Julian D., Ethan A., Lennon F. - TEJ4M
  */
@@ -146,6 +164,7 @@
 #include <SoftwareSerial.h>
 #include <Adafruit_Fingerprint.h>
 #include <EEPROM.h>
+#include <Servo.h>
 
 // =============================================================================
 // Hardware Setup
@@ -207,6 +226,40 @@ Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerprintSerial);
 // (closer to 50-80 mA). Still within the Uno's 5V regulator budget on a
 // 9V external supply, but worth a dedicated 5V supply for production.
 SoftwareSerial barcodeSerial(9, 10);
+
+// -- Buzzer --
+// Active-high piezo buzzer on digital pin 11. Active buzzer means the buzzer
+// has its own internal oscillator: digitalWrite(HIGH) makes sound, LOW silences.
+// A passive buzzer would only click on digitalWrite and would require tone()
+// (which fights with the Servo library for Timer1/Timer2). Use an active one.
+//
+// If the wired buzzer is silent on HIGH and sounds on LOW (less common
+// "low-active" type), invert the HIGH/LOW values in loop() and enterState().
+const byte BUZZER_PIN = 11;
+const unsigned long BUZZER_INTERVAL_MS = 200;  // 200ms on, 200ms off pattern
+
+// -- Lock Servo --
+// Standard hobby servo on digital pin 12. Drives a passive bolt mechanism:
+// the servo moves the bolt into / out of position and the bolt holds
+// mechanically without active torque. This lets us detach() immediately
+// after each move so the Servo library's Timer1 interrupts don't disrupt
+// SoftwareSerial RX timing on the fingerprint or barcode scanner.
+//
+// Power: drive servo from a dedicated 5V supply (NOT the Uno's 5V rail) and
+// share ground with the Uno. The 9g servo's stall current can pull the Uno
+// regulator below brownout when combined with the barcode scanner draw.
+//
+// LOCKED_ANGLE / UNLOCKED_ANGLE may need swapping depending on the bolt's
+// mechanical orientation; both are tunable here without touching state code.
+// SERVO_MOVE_MS is a blocking delay during attach/detach. Acceptable because
+// state transitions happen at human speed and no SoftwareSerial RX is active
+// during any of the transitions that move the servo (verified by tracing
+// every transition that crosses the lock-state boundary).
+const byte SERVO_PIN     = 12;
+const int  LOCKED_ANGLE   = 0;
+const int  UNLOCKED_ANGLE = 90;
+const unsigned long SERVO_MOVE_MS = 500;
+Servo lockServo;
 
 // =============================================================================
 // State Machine
@@ -309,6 +362,19 @@ unsigned long stateEnteredAt = 0;
 // Result count from the most recent bulk operation, shown on the completion screen
 int lastBulkCount = 0;
 
+// Cart lock state tracking. cartLocked starts true because setup() always
+// physically locks the cart at boot; the in-memory flag matches the physical
+// state from that point forward. enterState() consults this and only commands
+// a servo move when the new state's lock requirement differs, avoiding
+// pointless servo activity (and twitch) on transitions between same-locked
+// states like S_SIGN_OUT_SUCCESS -> S_SCAN_TIMER_ACTIVE.
+bool cartLocked = true;
+
+// Buzzer pattern state. Only used while currentState == S_BARCODE_ALARM;
+// silenced unconditionally on every other state transition.
+unsigned long lastBuzzerToggleAt = 0;
+bool buzzerOn = false;
+
 // =============================================================================
 // EEPROM Helpers
 // =============================================================================
@@ -375,8 +441,60 @@ void loadRecords() {
 }
 
 // =============================================================================
-// Admin Fingerprint Lookup Table
+// Lock and Buzzer Helpers
 // =============================================================================
+
+// Returns true if the given state requires the cart to be physically unlocked.
+// Used by enterState() to decide whether the servo needs to move on a
+// transition. Any state not listed here is treated as locked, so new states
+// added in the future default to the secure (locked) behaviour unless
+// explicitly opted in here.
+bool isUnlockedState(State s) {
+  switch (s) {
+    case S_SIGN_OUT_SUCCESS:
+    case S_SCAN_TIMER_ACTIVE:
+    case S_SIGN_IN_SUCCESS:
+    case S_ADMIN_MENU:
+    case S_BULK_CONFIRM:
+    case S_BULK_COMPLETE:
+    case S_BULK_IN_CONFIRM:
+    case S_BULK_IN_COMPLETE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Drives the servo to the locked position. attach() takes over Timer1 to
+// generate the position-PWM, so we detach() the moment the move is
+// physically complete. Outside of the SERVO_MOVE_MS window the pin is
+// floating from the Servo library's perspective and Timer1 interrupts stop,
+// freeing SoftwareSerial RX timing for the fingerprint and barcode sensors.
+//
+// Always physically commands the move regardless of the cartLocked tracker,
+// so it is safe to call from setup() to enforce a known-locked boot state.
+// Callers that want move-only-if-changing semantics check cartLocked first.
+void lockCart() {
+  lockServo.attach(SERVO_PIN);
+  lockServo.write(LOCKED_ANGLE);
+  delay(SERVO_MOVE_MS);
+  lockServo.detach();
+  cartLocked = true;
+  Serial.println(F("Cart locked."));
+}
+
+// Drives the servo to the unlocked position. See lockCart() for the
+// attach/detach rationale; same considerations apply here.
+void unlockCart() {
+  lockServo.attach(SERVO_PIN);
+  lockServo.write(UNLOCKED_ANGLE);
+  delay(SERVO_MOVE_MS);
+  lockServo.detach();
+  cartLocked = false;
+  Serial.println(F("Cart unlocked."));
+}
+
+
 
 // Maps each enrolled fingerprint slot ID to the corresponding admin number.
 // Each admin should be enrolled at multiple angles across separate slot IDs
@@ -506,6 +624,20 @@ void setup() {
 
   loadRecords();
 
+  // Buzzer: configured as output, default silent. Sound only happens during
+  // S_BARCODE_ALARM via the toggle pattern at the top of loop().
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Lock servo: actively drive to LOCKED on every boot. The physical servo
+  // position is unknown at startup (could have been left at any angle if
+  // power was cut mid-move), so we don't trust the cartLocked tracker here
+  // and just command the move unconditionally. This also handles the
+  // alarm-on-boot case: enterState(S_IDLE) below redirects to
+  // S_BARCODE_ALARM (also a locked state), so no second servo move is
+  // triggered by the redirect.
+  lockCart();
+
   // Fingerprint sensor communicates at 57600 baud over SoftwareSerial.
   finger.begin(57600);
   if (finger.verifyPassword()) {
@@ -530,6 +662,20 @@ void setup() {
 // =============================================================================
 
 void loop() {
+  // Buzzer pattern: while the cart is in barcode-alarm state, toggle the
+  // buzzer pin every BUZZER_INTERVAL_MS for a sharp pulsing tone. This runs
+  // before the keypad poll so that the beep continues uninterrupted across
+  // every state's logic. enterState() resets lastBuzzerToggleAt and silences
+  // the buzzer on every transition, so leaving the alarm guarantees silence
+  // and entering it gives a clean first beep at +BUZZER_INTERVAL_MS.
+  if (currentState == S_BARCODE_ALARM) {
+    if (millis() - lastBuzzerToggleAt >= BUZZER_INTERVAL_MS) {
+      buzzerOn = !buzzerOn;
+      digitalWrite(BUZZER_PIN, buzzerOn ? HIGH : LOW);
+      lastBuzzerToggleAt = millis();
+    }
+  }
+
   // Poll the keypad once per loop iteration. Returns '\0' if no key is pressed.
   char key = keypad.getKey();
 
@@ -1098,6 +1244,19 @@ void enterState(State newState) {
   stateEnteredAt = millis();
   inputBuffer[0] = '\0';
 
+  // Buzzer: silence on every transition. The loop's toggle code is what turns
+  // the buzzer back on while currentState == S_BARCODE_ALARM, so this single
+  // unconditional silencing handles "leaving alarm" cleanly regardless of
+  // which path was taken (admin auth, sticky redirect, etc.). Resetting
+  // lastBuzzerToggleAt on alarm entry guarantees the first beep happens at
+  // exactly +BUZZER_INTERVAL_MS rather than potentially firing immediately
+  // off a stale timestamp.
+  digitalWrite(BUZZER_PIN, LOW);
+  buzzerOn = false;
+  if (newState == S_BARCODE_ALARM) {
+    lastBuzzerToggleAt = millis();
+  }
+
   // SoftwareSerial constraint: only one instance can receive at a time on
   // AVR. Switch the active listener to whichever sensor the new state needs,
   // and flush its RX buffer so stale bytes from a prior session don't get
@@ -1115,6 +1274,20 @@ void enterState(State newState) {
   }
 
   updateLCD();
+
+  // Servo: physically move the lock only when the lock-state requirement
+  // actually changes between the previous and new state. Transitions between
+  // two unlocked states (e.g. S_SIGN_OUT_SUCCESS -> S_SCAN_TIMER_ACTIVE) or
+  // two locked states (e.g. S_IDLE -> S_ENTERING_STUDENT_NUMBER) skip this
+  // entirely so we don't reattach the servo unnecessarily. The 500ms move
+  // happens AFTER updateLCD() so the user sees the new screen immediately
+  // and the cart unlocks/locks a moment later.
+  bool shouldBeUnlocked = isUnlockedState(newState);
+  if (shouldBeUnlocked && cartLocked) {
+    unlockCart();
+  } else if (!shouldBeUnlocked && !cartLocked) {
+    lockCart();
+  }
 }
 
 // =============================================================================
