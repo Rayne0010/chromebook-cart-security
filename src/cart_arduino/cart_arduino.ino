@@ -172,6 +172,22 @@
  *     registered) still display briefly before redirecting back to alarm.
  *     LCD line 2 of the alarm screen changed from "*:Admin reset" to
  *     "Scan admin FP" to reflect the new flow.
+ *   - Sign-IN now requires barcode verification BEFORE the cart unlocks.
+ *     New state S_SIGN_IN_SCAN_ACTIVE sits between confirmSignIn() and
+ *     S_SIGN_IN_SUCCESS: cart stays LOCKED, student must scan the barcode
+ *     of the CB they're returning, and only on a matching scan does the
+ *     record clear and the cart unlock for the actual return. Mirrors the
+ *     sign-OUT scan-window pattern but with inverted lock semantics
+ *     (sign-out: unlock first then scan, sign-in: scan first then unlock).
+ *     Record clearing moved from confirmSignIn() to processBarcode()'s
+ *     sign-in success path -- previously confirmSignIn() cleared the record
+ *     immediately, which would have left a phantom-returned CB if the scan
+ *     subsequently failed. processBarcode() is now context-aware via
+ *     currentState: in sign-out scan a wrong/unknown barcode still trips
+ *     the alarm (cart is open, theft risk is real), but in sign-in scan it
+ *     falls back to a brief error display and returns to idle (cart never
+ *     opens, no security event). Sign-in scan timeout returns to idle
+ *     silently for the same reason.
  *
  * Team: Julian D., Ethan A., Lennon F. - TEJ4M
  */
@@ -300,6 +316,7 @@ enum State {
   S_BULK_IN_CONFIRM,         // admin flow: confirm sign-in of entire cart
   S_BULK_IN_COMPLETE,        // admin flow: bulk sign-in done, shown for 3s
   S_SCAN_TIMER_ACTIVE,       // post-sign-out: waiting for student to scan their CB
+  S_SIGN_IN_SCAN_ACTIVE,     // pre-sign-in: scan CB before cart unlocks for return
   S_BARCODE_ALARM            // wrong/unknown/missed scan; awaiting admin reset
 };
 
@@ -844,6 +861,20 @@ void loop() {
       }
       break;
 
+    case S_SIGN_IN_SCAN_ACTIVE:
+      // Same polling loop as the sign-out scan window, but timeout here
+      // routes to S_IDLE instead of S_BARCODE_ALARM. Rationale: the cart is
+      // still LOCKED during this window (unlike sign-out where it's open),
+      // so a missed scan isn't a security event -- the student just walked
+      // away or fumbled, no theft is possible.
+      pollBarcodeScanner();
+
+      if (millis() - stateEnteredAt >= SCAN_TIMER_MS) {
+        Serial.println(F("Sign-in scan timeout"));
+        enterState(S_IDLE);
+      }
+      break;
+
     case S_BARCODE_ALARM:
       // Poll the fingerprint sensor directly while the alarm screen is up,
       // so an admin can clear the alarm just by placing a finger on the
@@ -1034,40 +1065,71 @@ void pollBarcodeScanner() {
   }
 }
 
-// Looks up the scanned barcode in cbTable and either confirms the sign-out
-// (returning to S_IDLE) or trips the alarm (S_BARCODE_ALARM) on a mismatch.
+// Looks up the scanned barcode in cbTable and routes the result based on
+// which scan state we're in:
+//   S_SCAN_TIMER_ACTIVE  (sign-out): match -> S_IDLE; mismatch -> alarm
+//   S_SIGN_IN_SCAN_ACTIVE (sign-in): match -> clear record + S_SIGN_IN_SUCCESS;
+//                                    mismatch -> error -> idle (no alarm)
 // Called from pollBarcodeScanner() once a complete barcode has been received.
 void processBarcode() {
   Serial.print(F("Scanned: "));
   Serial.println(barcodeBuffer);
+
+  bool signInContext = (currentState == S_SIGN_IN_SCAN_ACTIVE);
 
   int scannedCN = lookupCBNumber(barcodeBuffer);
 
   if (scannedCN == 0) {
     // Barcode is not in cbTable -- either not a CB at all (random object)
     // or a CB whose barcode hasn't been registered in the lookup table yet.
-    Serial.println(F("Unknown barcode - alarm"));
-    enterState(S_BARCODE_ALARM);
+    Serial.println(F("Unknown barcode"));
+    if (signInContext) {
+      // Cart is still locked, no theft risk; just inform and reset.
+      showError("Unknown CB");
+    } else {
+      // Sign-out: cart is open, treat as security event.
+      enterState(S_BARCODE_ALARM);
+    }
     return;
   }
 
   if (scannedCN != expectedCN) {
-    // Barcode is a known CB, but not the one this student signed out for.
-    // This catches a student grabbing the wrong CB (or grabbing two).
+    // Barcode is a known CB, but not the one this transaction is for.
     Serial.print(F("Wrong CB: scanned "));
     Serial.print(scannedCN);
     Serial.print(F(", expected "));
-    Serial.print(expectedCN);
-    Serial.println(F(" - alarm"));
-    enterState(S_BARCODE_ALARM);
+    Serial.println(expectedCN);
+    if (signInContext) {
+      showError("Wrong CB");
+    } else {
+      // Sign-out: catches grabbing the wrong CB or grabbing two.
+      enterState(S_BARCODE_ALARM);
+    }
     return;
   }
 
-  // Match: scanned CB equals the one signed out. Verification complete.
+  // Match: scanned CB equals the expected one for this transaction.
   Serial.print(F("CB "));
   Serial.print(scannedCN);
   Serial.println(F(" verified."));
-  enterState(S_IDLE);
+
+  if (signInContext) {
+    // Sign-in completion: NOW we clear the record (deferred from
+    // confirmSignIn) and transition to the success state which will
+    // physically unlock the cart so the student can return the CB.
+    long studentNum = strtol(currentStudentNumber, NULL, 10);
+    checkoutRecords[scannedCN - 1] = 0;
+    saveRecord(scannedCN - 1);
+    Serial.print(F("Signed in: CB "));
+    Serial.print(scannedCN);
+    Serial.print(F(" from Student "));
+    Serial.println(studentNum);
+    enterState(S_SIGN_IN_SUCCESS);
+  } else {
+    // Sign-out completion: record was already set in confirmSignOut, so
+    // verification is all that's needed here.
+    enterState(S_IDLE);
+  }
 }
 
 // =============================================================================
@@ -1139,8 +1201,11 @@ void confirmSignOut() {
   enterState(S_SIGN_OUT_SUCCESS);
 }
 
-// Validates and commits a sign-in: clears the CB slot if it matches studentNum.
-// Fails if the CB number is out of range or the record does not match.
+// Validates a sign-in attempt and queues it for barcode verification. The
+// student's typed CB number is checked against the open record, but the
+// record is NOT cleared here -- that happens only after the student scans
+// the matching CB barcode in S_SIGN_IN_SCAN_ACTIVE. This way the cart stays
+// locked while we verify the student physically has the right CB.
 void confirmSignIn() {
   int cn = atoi(currentCN);
   long studentNum = strtol(currentStudentNumber, NULL, 10);
@@ -1156,15 +1221,17 @@ void confirmSignIn() {
     return;
   }
 
-  checkoutRecords[cn - 1] = 0;
-  saveRecord(cn - 1);
+  // Stash the CN so the scan state can verify the scanned barcode against
+  // it. processBarcode() will see currentState == S_SIGN_IN_SCAN_ACTIVE and
+  // route to the sign-in completion path on a match.
+  expectedCN = cn;
 
-  Serial.print(F("Signed in: CB "));
-  Serial.print(cn);
-  Serial.print(F(" from Student "));
-  Serial.println(studentNum);
+  Serial.print(F("Sign-in pending scan: Student "));
+  Serial.print(studentNum);
+  Serial.print(F(" -> CB "));
+  Serial.println(cn);
 
-  enterState(S_SIGN_IN_SUCCESS);
+  enterState(S_SIGN_IN_SCAN_ACTIVE);
 }
 
 // Assigns the admin's number to every currently available (0) CB slot.
@@ -1302,7 +1369,8 @@ void enterState(State newState) {
   if (newState == S_WAITING_FOR_FINGERPRINT || newState == S_BARCODE_ALARM) {
     fingerprintSerial.listen();
     while (fingerprintSerial.available()) fingerprintSerial.read();
-  } else if (newState == S_SCAN_TIMER_ACTIVE) {
+  } else if (newState == S_SCAN_TIMER_ACTIVE || newState == S_SIGN_IN_SCAN_ACTIVE) {
+    // Both scan states need the barcode scanner as the active listener.
     // Scanner is in sensing mode (configured once at deployment), so no
     // trigger command is needed -- the scanner self-arms on ambient motion.
     // Just take the listener and flush any bytes that piled up during idle.
@@ -1472,6 +1540,17 @@ void updateLCD() {
       lcd.print(expectedCN);
       lcd.setCursor(0, 1);
       lcd.print(F("Show barcode..."));
+      break;
+
+    case S_SIGN_IN_SCAN_ACTIVE:
+      lcd.setRGB(0, 100, 255);  // blue (matches sign-in color family)
+      lcd.setCursor(0, 0);
+      lcd.print(F("Scan CB #"));
+      lcd.print(expectedCN);
+      lcd.setCursor(0, 1);
+      // Tells the student that the cart unlocks AFTER scanning, not before.
+      // Different from sign-out: student already has the CB in hand.
+      lcd.print(F("to return..."));
       break;
 
     case S_BARCODE_ALARM:
