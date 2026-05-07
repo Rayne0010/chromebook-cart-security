@@ -154,6 +154,24 @@
  *     silence regardless of path. Power note: servo must be driven from a
  *     dedicated 5V supply with shared ground; the Uno's regulator can
  *     brown out under combined servo + scanner load.
+ *   - Alarm fingerprint flow simplified: removed the asterisk-press step
+ *     that previously transitioned S_BARCODE_ALARM -> S_WAITING_FOR_FINGERPRINT.
+ *     The fingerprint sensor is now polled directly from the S_BARCODE_ALARM
+ *     loop case, and enterState() switches fingerprintSerial.listen() on
+ *     entry to that state. Admin just places a finger on the sensor to
+ *     clear the alarm. Buzzer gating moved from currentState ==
+ *     S_BARCODE_ALARM to alarmActive so the beep continues uninterrupted
+ *     across any incidental state transitions while the alarm is unresolved
+ *     (it used to silence and restart on every transition, which felt
+ *     glitchy when paired with continuous fingerprint polling). enterState()
+ *     correspondingly silences the buzzer only when alarmActive is false.
+ *     handleFingerprintInput() detects alarm context: skips its 10s idle
+ *     timeout (which would otherwise fire repeatedly), and silently swallows
+ *     transient sensor/image-processing glitches instead of flashing them
+ *     over the alarm screen. Real auth failures (Access denied, Not
+ *     registered) still display briefly before redirecting back to alarm.
+ *     LCD line 2 of the alarm screen changed from "*:Admin reset" to
+ *     "Scan admin FP" to reflect the new flow.
  *
  * Team: Julian D., Ethan A., Lennon F. - TEJ4M
  */
@@ -662,13 +680,14 @@ void setup() {
 // =============================================================================
 
 void loop() {
-  // Buzzer pattern: while the cart is in barcode-alarm state, toggle the
-  // buzzer pin every BUZZER_INTERVAL_MS for a sharp pulsing tone. This runs
-  // before the keypad poll so that the beep continues uninterrupted across
-  // every state's logic. enterState() resets lastBuzzerToggleAt and silences
-  // the buzzer on every transition, so leaving the alarm guarantees silence
-  // and entering it gives a clean first beep at +BUZZER_INTERVAL_MS.
-  if (currentState == S_BARCODE_ALARM) {
+  // Buzzer pattern: while the alarm flag is active, toggle the buzzer pin
+  // every BUZZER_INTERVAL_MS for a sharp pulsing tone. Gated on alarmActive
+  // (not currentState) so the beep continues uninterrupted across S_BARCODE_ALARM,
+  // any S_ERROR_DISPLAY redirects back to alarm, and the brief windows where
+  // we transition through other states without yet clearing the flag.
+  // enterState() silences the buzzer only when alarmActive is false, so once
+  // an admin successfully authenticates the buzzer goes silent and stays silent.
+  if (alarmActive) {
     if (millis() - lastBuzzerToggleAt >= BUZZER_INTERVAL_MS) {
       buzzerOn = !buzzerOn;
       digitalWrite(BUZZER_PIN, buzzerOn ? HIGH : LOW);
@@ -826,13 +845,13 @@ void loop() {
       break;
 
     case S_BARCODE_ALARM:
-      // Admin can clear the alarm via fingerprint. * starts the existing
-      // fingerprint flow which on success lands in S_ADMIN_MENU; the admin
-      // can then exit normally with * to return to S_IDLE. No keypad input
-      // from students will dismiss the alarm.
-      if (key == '*') {
-        enterState(S_WAITING_FOR_FINGERPRINT);
-      }
+      // Poll the fingerprint sensor directly while the alarm screen is up,
+      // so an admin can clear the alarm just by placing a finger on the
+      // sensor -- no asterisk press needed. Keypad input is ignored entirely
+      // in this state; only a successful fingerprint match clears the alarm.
+      // handleFingerprintInput() detects we're in alarm mode (alarmActive is
+      // true) and skips its idle timeout so we keep polling forever.
+      handleFingerprintInput();
       break;
 
     default:
@@ -910,12 +929,20 @@ void handleCNInput(char key) {
   }
 }
 
-// Polls the fingerprint sensor once per loop tick while in S_WAITING_FOR_FINGERPRINT.
-// On a confident match, looks up the fingerID in adminTable to resolve the admin
-// number, then jumps directly to S_ADMIN_MENU. No manual number entry required.
-// Times out after FINGERPRINT_TIMEOUT_MS if no finger is detected.
+// Polls the fingerprint sensor once per loop tick. Used in two contexts:
+//   1. S_WAITING_FOR_FINGERPRINT: admin pressed * from idle to access bulk
+//      ops. Times out after FINGERPRINT_TIMEOUT_MS to avoid wasting power.
+//   2. S_BARCODE_ALARM: alarm is sounding and we're polling continuously
+//      until an admin clears it. No timeout (would just bounce back to alarm
+//      anyway), and transient sensor/image glitches are swallowed silently
+//      so the alarm screen doesn't flicker with error messages.
+//
+// On a confident match, looks up the fingerID in adminTable to resolve the
+// admin number, clears alarmActive if set, and jumps to S_ADMIN_MENU.
 void handleFingerprintInput() {
-  if (millis() - stateEnteredAt >= FINGERPRINT_TIMEOUT_MS) {
+  // Idle timeout only applies to the manual S_WAITING_FOR_FINGERPRINT entry;
+  // during an active alarm we keep polling indefinitely.
+  if (!alarmActive && millis() - stateEnteredAt >= FINGERPRINT_TIMEOUT_MS) {
     showError("Scan timeout");
     return;
   }
@@ -923,14 +950,20 @@ void handleFingerprintInput() {
   uint8_t p = finger.getImage();
   if (p == FINGERPRINT_NOFINGER) return;  // no finger present yet; keep polling
   if (p != FINGERPRINT_OK) {
-    showError("Sensor error");
+    // Transient sensor glitch. In alarm mode we silently retry rather than
+    // flash an error over the alarm screen; in normal admin entry we surface
+    // the error so the user knows the sensor isn't responding.
+    if (!alarmActive) showError("Sensor error");
     return;
   }
 
   // Convert image to feature template
   p = finger.image2Tz();
   if (p != FINGERPRINT_OK) {
-    showError("Image error");
+    // Same handling as sensor error: silent retry during alarm, visible
+    // error otherwise. Image errors usually mean poor finger placement and
+    // resolve on the next attempt.
+    if (!alarmActive) showError("Image error");
     return;
   }
 
@@ -1244,15 +1277,18 @@ void enterState(State newState) {
   stateEnteredAt = millis();
   inputBuffer[0] = '\0';
 
-  // Buzzer: silence on every transition. The loop's toggle code is what turns
-  // the buzzer back on while currentState == S_BARCODE_ALARM, so this single
-  // unconditional silencing handles "leaving alarm" cleanly regardless of
-  // which path was taken (admin auth, sticky redirect, etc.). Resetting
-  // lastBuzzerToggleAt on alarm entry guarantees the first beep happens at
-  // exactly +BUZZER_INTERVAL_MS rather than potentially firing immediately
-  // off a stale timestamp.
-  digitalWrite(BUZZER_PIN, LOW);
-  buzzerOn = false;
+  // Buzzer: only silence when there's no active alarm. Once an admin clears
+  // the alarm (alarmActive false in handleFingerprintInput), the next
+  // enterState call will silence the pin and the loop's toggle will stop
+  // firing because its gate is also alarmActive. While alarmActive is true,
+  // we leave the buzzer alone so it keeps pulsing across any state
+  // transitions (e.g. brief error displays, sticky-redirect re-entries).
+  // Resetting lastBuzzerToggleAt on transitions into the alarm state keeps
+  // the beep pattern aligned with the visible alarm screen.
+  if (!alarmActive) {
+    digitalWrite(BUZZER_PIN, LOW);
+    buzzerOn = false;
+  }
   if (newState == S_BARCODE_ALARM) {
     lastBuzzerToggleAt = millis();
   }
@@ -1260,8 +1296,10 @@ void enterState(State newState) {
   // SoftwareSerial constraint: only one instance can receive at a time on
   // AVR. Switch the active listener to whichever sensor the new state needs,
   // and flush its RX buffer so stale bytes from a prior session don't get
-  // mistaken for fresh data.
-  if (newState == S_WAITING_FOR_FINGERPRINT) {
+  // mistaken for fresh data. Both S_WAITING_FOR_FINGERPRINT (manual admin
+  // entry from idle) and S_BARCODE_ALARM (continuous polling during alarm)
+  // need the fingerprint sensor as the active listener.
+  if (newState == S_WAITING_FOR_FINGERPRINT || newState == S_BARCODE_ALARM) {
     fingerprintSerial.listen();
     while (fingerprintSerial.available()) fingerprintSerial.read();
   } else if (newState == S_SCAN_TIMER_ACTIVE) {
@@ -1441,9 +1479,9 @@ void updateLCD() {
       lcd.setCursor(0, 0);
       lcd.print(F("!! ALARM !!"));
       lcd.setCursor(0, 1);
-      // Tells the admin how to clear the alarm. * starts the existing
-      // fingerprint flow which on success transitions to S_ADMIN_MENU.
-      lcd.print(F("*:Admin reset"));
+      // Fingerprint sensor is being polled continuously while this screen
+      // is up; admin just places finger on sensor to clear (no keypress).
+      lcd.print(F("Scan admin FP"));
       break;
 
     default:
