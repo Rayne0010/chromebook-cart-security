@@ -1050,6 +1050,11 @@ void pollBarcodeScanner() {
         barcodeBuffer[barcodePos] = '\0';
         processBarcode();
         barcodePos = 0;
+        // processBarcode() always triggers a state transition, so any bytes
+        // still sitting in the SoftwareSerial RX buffer belong to a state
+        // that no longer wants them. Bail out; the next entry to a scan
+        // state flushes the buffer on entry via enterState().
+        return;
       }
     } else if (c >= ' ' && c <= '~') {
       // Printable ASCII: append if there's room. Anything else is dropped.
