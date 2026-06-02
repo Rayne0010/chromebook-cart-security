@@ -38,7 +38,18 @@ const int NUM_AUTHORIZED = sizeof(AUTHORIZED_UIDS) / sizeof(AUTHORIZED_UIDS[0]);
 // --- Constants ---
 const int LOCKED_ANGLE   = 0;
 const int UNLOCKED_ANGLE = 90;
-const int UNLOCK_DURATION_MS = 5000;  // Door stays unlocked for 5 seconds
+const unsigned long UNLOCK_DURATION_MS = 5000;  // Door stays unlocked for 5 seconds
+const unsigned long DENY_DURATION_MS   = 3000;  // Deny message duration
+
+// --- State Machine ---
+enum EntranceState {
+  WAITING_FOR_RFID,
+  DOOR_UNLOCKED,
+  ACCESS_DENIED_DISPLAY
+};
+
+EntranceState currentState = WAITING_FOR_RFID;
+unsigned long stateEnteredAt = 0;
 
 void setup() {
   Serial.begin(9600);
@@ -57,6 +68,23 @@ void setup() {
 }
 
 void loop() {
+  unsigned long now = millis();
+
+  // Handle timed state exits (non-blocking)
+  if (currentState == DOOR_UNLOCKED && now - stateEnteredAt >= UNLOCK_DURATION_MS) {
+    doorServo.write(LOCKED_ANGLE);
+    enterState(WAITING_FOR_RFID);
+    return;
+  }
+
+  if (currentState == ACCESS_DENIED_DISPLAY && now - stateEnteredAt >= DENY_DURATION_MS) {
+    enterState(WAITING_FOR_RFID);
+    return;
+  }
+
+  // Only read RFID when idle
+  if (currentState != WAITING_FOR_RFID) return;
+
   if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
     return;
   }
@@ -69,6 +97,29 @@ void loop() {
 
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
+}
+
+void enterState(EntranceState newState) {
+  currentState = newState;
+  stateEnteredAt = millis();
+
+  lcd.clear();
+  switch (newState) {
+    case WAITING_FOR_RFID:
+      lcd.setCursor(0, 0);
+      lcd.print("Scan RFID card");
+      break;
+    case DOOR_UNLOCKED:
+      lcd.setCursor(0, 0);
+      lcd.print("Access Granted");
+      lcd.setCursor(0, 1);
+      lcd.print("Door unlocked");
+      break;
+    case ACCESS_DENIED_DISPLAY:
+      lcd.setCursor(0, 0);
+      lcd.print("Access Denied");
+      break;
+  }
 }
 
 bool isAuthorized(byte *uid) {
@@ -87,28 +138,11 @@ bool isAuthorized(byte *uid) {
 
 void grantAccess() {
   Serial.println("Access granted.");
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Access Granted");
-  lcd.setCursor(0, 1);
-  lcd.print("Door unlocked");
-
   doorServo.write(UNLOCKED_ANGLE);
-  delay(UNLOCK_DURATION_MS);
-  doorServo.write(LOCKED_ANGLE);
-
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Scan RFID card");
+  enterState(DOOR_UNLOCKED);
 }
 
 void denyAccess() {
   Serial.println("Access denied.");
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Access Denied");
-  delay(3000);
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("Scan RFID card");
+  enterState(ACCESS_DENIED_DISPLAY);
 }
