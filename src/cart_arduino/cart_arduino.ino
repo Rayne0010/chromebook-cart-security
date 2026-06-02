@@ -21,7 +21,7 @@
  *   -> S_BULK_IN_CONFIRM -> S_BULK_IN_COMPLETE
  *
  * States (Secondary Scope - Barcode):
- *   S_SIGN_OUT_SUCCESS -(3s)--> S_SCAN_TIMER_ACTIVE
+ *   S_SIGN_OUT_SUCCESS -(#/30s)--> S_SCAN_TIMER_ACTIVE (LOCKED)
  *   -- correct CB scanned --> S_IDLE
  *   -- wrong/unknown/timeout --> S_BARCODE_ALARM -(*)--> S_WAITING_FOR_FINGERPRINT
  *
@@ -138,10 +138,11 @@
  *     EEPROM byte's ~100k write endurance.
  *   - Cart lock servo (pin 12) and alarm buzzer (pin 11) integrated. Cart
  *     starts LOCKED unconditionally on every boot. The unlocked states are:
- *     S_SIGN_OUT_SUCCESS, S_SIGN_IN_SUCCESS, S_SCAN_TIMER_ACTIVE,
+ *     S_SIGN_OUT_SUCCESS, S_SIGN_IN_SUCCESS,
  *     S_ADMIN_MENU, S_BULK_CONFIRM, S_BULK_COMPLETE, S_BULK_IN_CONFIRM,
- *     S_BULK_IN_COMPLETE. Everything else (idle, input, fingerprint waiting,
- *     error display, alarm) is locked. enterState() only commands a servo
+ *     S_BULK_IN_COMPLETE. S_SCAN_TIMER_ACTIVE is now LOCKED (student closes
+ *     door before scanning). Everything else (idle, input, fingerprint waiting,
+ *     error display, alarm) is also locked. enterState() only commands a servo
  *     move when the lock requirement actually changes, so transitions
  *     between two same-locked states don't activate the servo. The servo is
  *     attached only during the 500ms move and detached immediately after,
@@ -188,6 +189,15 @@
  *     falls back to a brief error display and returns to idle (cart never
  *     opens, no security event). Sign-in scan timeout returns to idle
  *     silently for the same reason.
+ *   - Servo unlock timing redesigned: S_SIGN_OUT_SUCCESS and S_SIGN_IN_SUCCESS
+ *     now stay unlocked until the student presses # to confirm the door is
+ *     closed, or until DOOR_OPEN_TIMEOUT_MS (30s) elapses as a fallback. The
+ *     previous 3s auto-timeout (MESSAGE_DISPLAY_DURATION_MS) was far too short
+ *     to open the cart, take or return a Chromebook, and close the door before
+ *     the bolt re-engaged. S_SCAN_TIMER_ACTIVE removed from isUnlockedState():
+ *     the cart now locks at # press (door closed) before the barcode scan,
+ *     rather than staying open for the entire 30s scan window. LCD messages
+ *     updated to show "Close door, # ok" so students know what to do.
  *
  * Team: Julian D., Ethan A., Lennon F. - TEJ4M
  */
@@ -306,8 +316,8 @@ enum State {
   S_ENTERING_STUDENT_NUMBER, // student typing their 9-digit number
   S_ENTERING_CN_OUT,         // student typing Chromebook number to sign out
   S_ENTERING_CN_IN,          // student typing Chromebook number to sign in
-  S_SIGN_OUT_SUCCESS,        // confirmation message shown for 3s then -> SCAN_TIMER
-  S_SIGN_IN_SUCCESS,         // confirmation message shown for 3s then -> IDLE
+  S_SIGN_OUT_SUCCESS,        // cart unlocked; student takes CB; # closes+proceeds to scan timer
+  S_SIGN_IN_SUCCESS,         // cart unlocked; student returns CB; # closes+proceeds to idle
   S_ERROR_DISPLAY,           // error message shown for 3s then -> IDLE
   S_WAITING_FOR_FINGERPRINT, // admin flow: waiting for finger on sensor
   S_ADMIN_MENU,              // admin flow: choose bulk-out (3), bulk-in (2), or back (*)
@@ -358,6 +368,7 @@ const unsigned long FINGERPRINT_TIMEOUT_MS      = 10000;  // 10s to scan finger
 const unsigned long INPUT_TIMEOUT_MS            = 30000;  // 30s idle on any input state
 const unsigned long ADMIN_MENU_TIMEOUT_MS       = 20000;  // 20s idle on admin menu
 const unsigned long MESSAGE_DISPLAY_DURATION_MS = 3000;   // 3s for success/error messages
+const unsigned long DOOR_OPEN_TIMEOUT_MS        = 30000;  // 30s to close cart door after sign-out/in
 const unsigned long SCAN_TIMER_MS               = 30000;  // 30s window to scan after sign-out
 
 // Fixed-size char arrays replace String objects to avoid heap fragmentation.
@@ -487,7 +498,6 @@ void loadRecords() {
 bool isUnlockedState(State s) {
   switch (s) {
     case S_SIGN_OUT_SUCCESS:
-    case S_SCAN_TIMER_ACTIVE:
     case S_SIGN_IN_SUCCESS:
     case S_ADMIN_MENU:
     case S_BULK_CONFIRM:
@@ -755,22 +765,30 @@ void loop() {
       handleCNInput(key);
       break;
 
-    // S_ERROR_DISPLAY and S_SIGN_IN_SUCCESS just display a message and return
-    // to idle. S_SIGN_OUT_SUCCESS is special: it transitions into the barcode
-    // scan timer so the student must verify the CB they just signed out.
+    // S_ERROR_DISPLAY just shows a message then returns to idle.
+    // S_SIGN_OUT_SUCCESS and S_SIGN_IN_SUCCESS stay unlocked until the student
+    // presses # to confirm the door is closed, then proceed (scan timer / idle).
+    // DOOR_OPEN_TIMEOUT_MS auto-proceeds if # is never pressed, so the cart
+    // doesn't stay open forever if the student walks away without confirming.
     case S_ERROR_DISPLAY:
-    case S_SIGN_IN_SUCCESS:
       if (millis() - stateEnteredAt >= MESSAGE_DISPLAY_DURATION_MS) {
         enterState(S_IDLE);
       }
       break;
 
     case S_SIGN_OUT_SUCCESS:
-      if (millis() - stateEnteredAt >= MESSAGE_DISPLAY_DURATION_MS) {
-        // After the success confirmation, require the student to scan the
-        // physical barcode on the CB they just signed out. expectedCN was
-        // set in confirmSignOut() so S_SCAN_TIMER_ACTIVE knows what to match.
+      // Cart is unlocked; student takes CB and closes door.
+      // # confirms door is closed -> barcode scan starts on a locked cart.
+      if (key == '#' || millis() - stateEnteredAt >= DOOR_OPEN_TIMEOUT_MS) {
         enterState(S_SCAN_TIMER_ACTIVE);
+      }
+      break;
+
+    case S_SIGN_IN_SUCCESS:
+      // Cart is unlocked; student puts CB back and closes door.
+      // # confirms door is closed -> return to idle and lock.
+      if (key == '#' || millis() - stateEnteredAt >= DOOR_OPEN_TIMEOUT_MS) {
+        enterState(S_IDLE);
       }
       break;
 
@@ -1388,11 +1406,12 @@ void enterState(State newState) {
 
   // Servo: physically move the lock only when the lock-state requirement
   // actually changes between the previous and new state. Transitions between
-  // two unlocked states (e.g. S_SIGN_OUT_SUCCESS -> S_SCAN_TIMER_ACTIVE) or
   // two locked states (e.g. S_IDLE -> S_ENTERING_STUDENT_NUMBER) skip this
   // entirely so we don't reattach the servo unnecessarily. The 500ms move
   // happens AFTER updateLCD() so the user sees the new screen immediately
   // and the cart unlocks/locks a moment later.
+  // Note: S_SIGN_OUT_SUCCESS (unlocked) -> S_SCAN_TIMER_ACTIVE (locked) IS
+  // a lock-boundary crossing; lockCart() fires after the student presses #.
   bool shouldBeUnlocked = isUnlockedState(newState);
   if (shouldBeUnlocked && cartLocked) {
     unlockCart();
@@ -1455,19 +1474,19 @@ void updateLCD() {
     case S_SIGN_OUT_SUCCESS:
       lcd.setRGB(0, 255, 0);
       lcd.setCursor(0, 0);
-      lcd.print(F("Signed OUT!"));
-      lcd.setCursor(0, 1);
-      lcd.print(F("CB #"));
+      lcd.print(F("OUT: CB #"));
       lcd.print(currentCN);
+      lcd.setCursor(0, 1);
+      lcd.print(F("Close door, # ok"));
       break;
 
     case S_SIGN_IN_SUCCESS:
       lcd.setRGB(0, 255, 0);
       lcd.setCursor(0, 0);
-      lcd.print(F("Signed IN!"));
-      lcd.setCursor(0, 1);
-      lcd.print(F("CB #"));
+      lcd.print(F("IN: CB #"));
       lcd.print(currentCN);
+      lcd.setCursor(0, 1);
+      lcd.print(F("Close door, # ok"));
       break;
 
     case S_ERROR_DISPLAY:
