@@ -17,9 +17,12 @@ Servo doorServo;
 
 void setup() {
   doorServo.attach(SERVO_PIN);
+  delay(500);                      // Give servo time to initialize
   doorServo.write(UNLOCKED_ANGLE);
+  delay(1000);                     // Hold long enough to reach position
 }
 
 void loop() {
-  // Holds unlocked indefinitely
+  doorServo.write(UNLOCKED_ANGLE); // Keep resending in case of signal drop
+  delay(100);
 }
