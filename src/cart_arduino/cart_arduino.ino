@@ -608,13 +608,13 @@ struct CBEntry {
 
 const CBEntry cbTable[] PROGMEM = {
   // -- Replace placeholders with real asset-tag barcodes as they're captured --
-  { "CB001-PLACEHLD",  1 },
+  { "5CG0316P3P",     1 },
   { "CB002-PLACEHLD",  2 },
   { "CB003-PLACEHLD",  3 },
   { "CB004-PLACEHLD",  4 },
   { "CB005-PLACEHLD",  5 },
   { "CB006-PLACEHLD",  6 },
-  { "CB007-PLACEHLD",  7 },
+  { "1H85392GMX",     7 },
   { "CB008-PLACEHLD",  8 },
   { "CB009-PLACEHLD",  9 },
   { "CB010-PLACEHLD", 10 },
