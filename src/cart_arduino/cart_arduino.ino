@@ -838,6 +838,10 @@ void loop() {
 
     case S_BULK_CONFIRM:
       // # confirms the bulk sign-out; * cancels and returns to admin menu.
+      if (millis() - stateEnteredAt >= ADMIN_MENU_TIMEOUT_MS) {
+        enterState(S_IDLE);
+        break;
+      }
       if (key == '#') {
         processBulkSignOut();
       } else if (key == '*') {
@@ -853,6 +857,10 @@ void loop() {
 
     case S_BULK_IN_CONFIRM:
       // # confirms the bulk sign-in; * cancels and returns to admin menu.
+      if (millis() - stateEnteredAt >= ADMIN_MENU_TIMEOUT_MS) {
+        enterState(S_IDLE);
+        break;
+      }
       if (key == '#') {
         processBulkSignIn();
       } else if (key == '*') {
